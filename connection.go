@@ -402,6 +402,9 @@ func (c *Connection) handleSettingsFrame(frame *Frame) error {
 				c.settingsMu.Unlock()
 				return fmt.Errorf("invalid max frame size: %d", value)
 			}
+			c.settingsMu.Unlock()
+			c.peerSettings[id] = value
+			c.settingsMu.Lock()
 		case SettingsEnablePush:
 			if value != 0 && value != 1 {
 				c.settingsMu.Unlock()
