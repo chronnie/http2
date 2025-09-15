@@ -19,12 +19,22 @@ type HTTP2Transport struct {
 }
 
 // NewHTTP2Transport creates a new HTTP/2 transport instance.
-// The address parameter specifies the target server address (host:port).
 func NewHTTP2Transport(address string) (*HTTP2Transport, error) {
+	LogConnection("creating_transport", address, map[string]interface{}{
+		"protocol": "HTTP/2.0",
+	})
+
 	client, err := NewClient(address)
 	if err != nil {
+		LogError(err, "transport_creation_failed", map[string]interface{}{
+			"address": address,
+		})
 		return nil, fmt.Errorf("failed to create HTTP/2 client: %w", err)
 	}
+
+	LogConnection("transport_created", address, map[string]interface{}{
+		"status": "success",
+	})
 
 	return &HTTP2Transport{
 		client: client,
@@ -37,24 +47,42 @@ func NewHTTP2Transport(address string) (*HTTP2Transport, error) {
 // and converts the response back to standard http.Response format.
 func (t *HTTP2Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if t.closed {
+		LogError(fmt.Errorf("transport closed"), "roundtrip_failed", map[string]interface{}{
+			"url": req.URL.String(),
+		})
 		return nil, fmt.Errorf("transport is closed")
 	}
+
+	LogRequest(req.Method, req.URL.Path, req.Host, nil)
 
 	// Convert standard http.Request to internal http2.Request format
 	http2Req, err := t.convertRequest(req)
 	if err != nil {
+		LogError(err, "request_conversion_failed", map[string]interface{}{
+			"method": req.Method,
+			"url":    req.URL.String(),
+		})
 		return nil, fmt.Errorf("failed to convert request: %w", err)
 	}
 
 	// Send request over HTTP/2 connection
 	http2Resp, err := t.client.SendRequest(http2Req)
 	if err != nil {
+		LogError(err, "http2_request_failed", map[string]interface{}{
+			"method": req.Method,
+			"url":    req.URL.String(),
+		})
 		return nil, fmt.Errorf("HTTP/2 request failed: %w", err)
 	}
+
+	LogResponse(http2Resp.StatusCode, http2Resp.Headers, len(http2Resp.Body))
 
 	// Convert internal http2.Response back to standard http.Response
 	httpResp, err := t.convertResponse(http2Resp, req)
 	if err != nil {
+		LogError(err, "response_conversion_failed", map[string]interface{}{
+			"status_code": http2Resp.StatusCode,
+		})
 		return nil, fmt.Errorf("failed to convert response: %w", err)
 	}
 
@@ -78,6 +106,12 @@ func (t *HTTP2Transport) convertRequest(req *http.Request) (*Request, error) {
 	if method == "" {
 		method = MethodGET
 	}
+
+	Logger.Debug().
+		Str("event", "request_conversion").
+		Str("method", method).
+		Str("url", req.URL.String()).
+		Msg("Converting HTTP request to HTTP/2")
 
 	// Construct request path including query parameters
 	path := req.URL.Path
@@ -146,6 +180,12 @@ func (t *HTTP2Transport) convertRequest(req *http.Request) (*Request, error) {
 // convertResponse converts internal http2.Response to standard http.Response format.
 // This includes parsing status codes and converting headers back to HTTP/1.1 format.
 func (t *HTTP2Transport) convertResponse(resp *Response, originalReq *http.Request) (*http.Response, error) {
+	Logger.Debug().
+		Str("event", "response_conversion").
+		Int("status_code", resp.StatusCode).
+		Int("body_length", len(resp.Body)).
+		Msg("Converting HTTP/2 response to HTTP")
+
 	// Parse HTTP status code from response
 	statusCode := resp.StatusCode
 	if statusCode == 0 && resp.Status != "" {

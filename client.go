@@ -108,6 +108,11 @@ func (c *Client) SendRequest(req *Request) (*Response, error) {
 
 	streamID := c.conn.GetNextStreamID()
 
+	LogStream(streamID, "idle", "sending_request", map[string]interface{}{
+		"method": req.Method,
+		"path":   req.Path,
+	})
+
 	// Create and send HEADERS frame
 	headersFrame, err := c.createHeadersFrame(streamID, req)
 	if err != nil {
