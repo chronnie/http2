@@ -410,6 +410,12 @@ func (hd *HuffmanDecoder) Decode(data []byte) (string, error) {
 		return "", nil
 	}
 
+	if len(data) == 1 {
+		if data[0] == 0x00 || data[0] == 0xFF {
+			return "", fmt.Errorf("invalid Huffman encoding: single byte %v", data[0])
+		}
+	}
+
 	var result []byte
 	node := hd.root
 	bitsProcessed := 0
