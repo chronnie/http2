@@ -754,15 +754,11 @@ func (c *Connection) GetNextStreamID() uint32 {
 
 	if c.isServer {
 		// Server-initiated streams are even
-		if c.lastStreamID == 0 || c.lastStreamID%2 == 1 {
-			c.lastStreamID = 2
-		} else {
-			c.lastStreamID += 2
-		}
+		c.lastStreamID += 2
 	} else {
 		// Client-initiated streams are odd
 		if c.lastStreamID == 0 || c.lastStreamID%2 == 0 {
-			c.lastStreamID = 1
+			c.lastStreamID += 1
 		} else {
 			c.lastStreamID += 2
 		}
