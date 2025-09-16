@@ -1,6 +1,6 @@
 module github.com/chronnie/http2
 
-go 1.24.1
+go 1.22.0
 
 require github.com/rs/zerolog v1.34.0
 
