@@ -3,23 +3,13 @@ package http2
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
 	"sync"
-)
-
-// Flags for different frame types
-const (
-	FlagDataEndStream     = 0x1
-	FlagDataPadded        = 0x8
-	FlagHeadersEndStream  = 0x1
-	FlagHeadersEndHeaders = 0x4
-	FlagHeadersPadded     = 0x8
-	FlagHeadersPriority   = 0x20
-	FlagSettingsAck       = 0x1
-	FlagPingAck           = 0x1
+	"sync/atomic"
 )
 
 // Settings parameters as defined in RFC 7540 Section 6.5.2
@@ -69,10 +59,23 @@ type Connection struct {
 	peerSettings map[uint16]uint32 // Peer's settings
 	settingsMu   sync.RWMutex
 
-	// Stream management
+	// Stream management with concurrency control
 	streams      map[uint32]*Stream
 	streamsMu    sync.RWMutex
 	lastStreamID uint32 // Last stream ID used by this endpoint
+
+	// *** ENHANCED CONCURRENT STREAM MANAGEMENT ***
+	// RFC 7540 Section 5.1.2 - Stream Concurrency
+	activeStreams        int32               // Current number of active streams
+	maxConcurrentStreams uint32              // Peer's MAX_CONCURRENT_STREAMS setting
+	streamQueue          chan *StreamRequest // Queue for pending stream requests
+	streamSemaphore      chan struct{}       // Semaphore to limit concurrent streams
+	concurrencyMu        sync.RWMutex        // Protects concurrency counters
+
+	// *** SEQUENTIAL STREAM ORDERING ***
+	// Ensures frames are sent in proper order to prevent HPACK corruption
+	streamOrderMu        sync.Mutex // Serializes stream creation and frame sending
+	nextExpectedStreamID uint32     // Next stream ID to maintain ordering
 
 	// Flow control as per RFC 7540 Section 6.9
 	connectionWindow     int32 // Our connection-level receive window
@@ -80,19 +83,20 @@ type Connection struct {
 	initialWindowSize    int32 // Default window size for new streams
 	flowControlMu        sync.Mutex
 
-	// Header compression
+	// Header compression - MUST be synchronized per RFC 7540 Section 4.3
 	headerEncoder *HPACKEncoder
 	headerDecoder *HPACKDecoder
+	hpackMu       sync.Mutex // Protects HPACK encoder/decoder state
 
 	// Graceful shutdown
 	closeChan chan struct{}
 	closeOnce sync.Once
 
-	// Frame processing
-	writeMu sync.Mutex // Serializes frame writing
+	// Frame processing with ordering guarantee
+	writeMu sync.Mutex // Serializes ALL frame writing for proper ordering
 }
 
-// NewConnection creates a new HTTP/2 connection (cleartext TCP)
+// NewConnection creates a new HTTP/2 connection with enhanced concurrency management
 func NewConnection(address string) (*Connection, error) {
 	conn, err := net.Dial("tcp", address)
 	if err != nil {
@@ -110,6 +114,13 @@ func NewConnection(address string) (*Connection, error) {
 		peerSettings: make(map[uint16]uint32),
 		streams:      make(map[uint32]*Stream),
 
+		// Initialize concurrency management
+		activeStreams:        0,
+		maxConcurrentStreams: 100, // Default to 100 as recommended by RFC 7540
+		streamQueue:          make(chan *StreamRequest, 100),
+		streamSemaphore:      make(chan struct{}, 100),
+		nextExpectedStreamID: 1, // Client streams start from 1
+
 		// Flow control windows - RFC 7540 Section 6.9.2
 		connectionWindow:     65535, // Initial connection window
 		peerConnectionWindow: 65535, // Peer's initial connection window
@@ -122,9 +133,15 @@ func NewConnection(address string) (*Connection, error) {
 
 	// Set default settings as per RFC 7540 Section 6.5.2
 	c.settings[SettingsHeaderTableSize] = 4096
-	c.settings[SettingsEnablePush] = 1
+	c.settings[SettingsEnablePush] = 0
+	c.settings[SettingsMaxConcurrentStreams] = 100 // Allow peer to create 100 streams
 	c.settings[SettingsInitialWindowSize] = 65535
 	c.settings[SettingsMaxFrameSize] = 16384
+
+	// Initialize semaphore with current limit
+	for i := 0; i < int(c.maxConcurrentStreams); i++ {
+		c.streamSemaphore <- struct{}{}
+	}
 
 	// Send connection preface
 	if err := c.sendConnectionPreface(); err != nil {
@@ -132,7 +149,217 @@ func NewConnection(address string) (*Connection, error) {
 		return nil, fmt.Errorf("failed to send connection preface: %w", err)
 	}
 
+	// Start stream processor goroutine
+	go c.streamProcessor()
+
 	return c, nil
+}
+
+// RequestStream requests a new stream with concurrency control
+// RFC 7540 Section 5.1.2 - respects SETTINGS_MAX_CONCURRENT_STREAMS
+func (c *Connection) RequestStream(ctx context.Context, headers map[string]string, endStream bool) (*Stream, error) {
+	if c.isClosed {
+		return nil, fmt.Errorf("connection is closed")
+	}
+
+	// Check if we can create more streams
+	if !c.canCreateStream() {
+		return nil, fmt.Errorf("cannot create stream: would exceed peer's MAX_CONCURRENT_STREAMS limit")
+	}
+
+	// Get next stream ID with proper ordering
+	streamID := c.getNextStreamIDSequential()
+
+	req := &StreamRequest{
+		StreamID:     streamID,
+		Headers:      headers,
+		EndStream:    endStream,
+		ResponseChan: make(chan *StreamResponse, 1),
+		Context:      ctx,
+	}
+
+	// Queue the request for sequential processing
+	select {
+	case c.streamQueue <- req:
+		// Request queued successfully
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-c.closeChan:
+		return nil, fmt.Errorf("connection closed")
+	}
+
+	// Wait for response
+	select {
+	case resp := <-req.ResponseChan:
+		if resp.Error != nil {
+			return nil, resp.Error
+		}
+		return resp.Stream, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-c.closeChan:
+		return nil, fmt.Errorf("connection closed")
+	}
+}
+
+// streamProcessor processes stream requests sequentially to maintain ordering
+func (c *Connection) streamProcessor() {
+	for {
+		select {
+		case req := <-c.streamQueue:
+			c.processStreamRequest(req)
+		case <-c.closeChan:
+			return
+		}
+	}
+}
+
+// processStreamRequest processes a single stream request with proper ordering
+func (c *Connection) processStreamRequest(req *StreamRequest) {
+	// Acquire semaphore slot (blocks if at limit)
+	select {
+	case <-c.streamSemaphore:
+		// Got semaphore slot
+	case <-req.Context.Done():
+		req.ResponseChan <- &StreamResponse{Error: req.Context.Err()}
+		return
+	case <-c.closeChan:
+		req.ResponseChan <- &StreamResponse{Error: fmt.Errorf("connection closed")}
+		return
+	}
+
+	// Ensure sequential ordering of stream creation and frame sending
+	c.streamOrderMu.Lock()
+	defer c.streamOrderMu.Unlock()
+
+	// Double-check connection state under lock
+	if c.isClosed {
+		c.streamSemaphore <- struct{}{} // Release semaphore
+		req.ResponseChan <- &StreamResponse{Error: fmt.Errorf("connection closed")}
+		return
+	}
+
+	// Create stream
+	stream := c.createStreamInternal(req.StreamID)
+
+	// Send HEADERS frame with HPACK synchronization
+	if err := c.sendHeadersFrameSync(stream, req.Headers, req.EndStream); err != nil {
+		// Failed to send headers, clean up
+		c.removeStream(req.StreamID)
+		c.streamSemaphore <- struct{}{} // Release semaphore
+		req.ResponseChan <- &StreamResponse{Error: fmt.Errorf("failed to send HEADERS frame: %w", err)}
+		return
+	}
+
+	// Update stream state
+	stream.mu.Lock()
+	stream.State = StreamStateOpen
+	if req.EndStream {
+		stream.State = StreamStateHalfClosedLocal
+		stream.EndStream = true
+	}
+	stream.mu.Unlock()
+
+	// Increment active stream counter
+	c.concurrencyMu.Lock()
+	c.activeStreams++
+	c.concurrencyMu.Unlock()
+
+	// Return successful response
+	req.ResponseChan <- &StreamResponse{Stream: stream, Error: nil}
+}
+
+// canCreateStream checks if we can create a new stream without exceeding limits
+func (c *Connection) canCreateStream() bool {
+	c.concurrencyMu.RLock()
+	defer c.concurrencyMu.RUnlock()
+
+	c.settingsMu.RLock()
+	maxStreams := c.peerSettings[SettingsMaxConcurrentStreams]
+	c.settingsMu.RUnlock()
+
+	if maxStreams == 0 {
+		maxStreams = 100 // Default recommended by RFC 7540
+	}
+
+	return uint32(c.activeStreams) < maxStreams
+}
+
+// getNextStreamIDSequential returns the next stream ID with proper sequencing
+func (c *Connection) getNextStreamIDSequential() uint32 {
+	// Note: streamOrderMu should already be held by caller
+	c.streamsMu.Lock()
+	defer c.streamsMu.Unlock()
+
+	if c.isServer {
+		// Server-initiated streams are even
+		if c.lastStreamID == 0 || c.lastStreamID%2 == 1 {
+			c.lastStreamID = 2
+		} else {
+			c.lastStreamID += 2
+		}
+	} else {
+		// Client-initiated streams are odd - RFC 7540 Section 5.1.1
+		if c.lastStreamID == 0 || c.lastStreamID%2 == 0 {
+			c.lastStreamID = 1
+		} else {
+			c.lastStreamID += 2
+		}
+	}
+
+	c.nextExpectedStreamID = c.lastStreamID
+	return c.lastStreamID
+}
+
+// sendHeadersFrameSync sends HEADERS frame with HPACK synchronization
+func (c *Connection) sendHeadersFrameSync(stream *Stream, headers map[string]string, endStream bool) error {
+	// Encode headers with HPACK synchronization
+	c.hpackMu.Lock()
+	encodedHeaders, err := c.headerEncoder.Encode(headers)
+	c.hpackMu.Unlock()
+
+	if err != nil {
+		return fmt.Errorf("HPACK encoding failed: %w", err)
+	}
+
+	// Create HEADERS frame
+	flags := uint8(FlagHeadersEndHeaders)
+	if endStream {
+		flags |= FlagHeadersEndStream
+	}
+
+	frame := &Frame{
+		Length:   uint32(len(encodedHeaders)),
+		Type:     FrameTypeHEADERS,
+		Flags:    flags,
+		StreamID: stream.ID,
+		Payload:  encodedHeaders,
+	}
+
+	// Send frame (writeFrame handles writeMu internally)
+	return c.writeFrame(frame)
+}
+
+// removeStream removes a stream from tracking and releases concurrency slot
+func (c *Connection) removeStream(streamID uint32) {
+	c.streamsMu.Lock()
+	if _, exists := c.streams[streamID]; exists {
+		delete(c.streams, streamID)
+	}
+	c.streamsMu.Unlock()
+
+	// Decrement active streams counter
+	c.concurrencyMu.Lock()
+	c.activeStreams--
+	c.concurrencyMu.Unlock()
+
+	// Release semaphore slot
+	select {
+	case c.streamSemaphore <- struct{}{}:
+		// Released successfully
+	default:
+		// Semaphore full (shouldn't happen but handle gracefully)
+	}
 }
 
 // sendConnectionPreface sends the HTTP/2 connection preface as per RFC 7540 Section 3.5
@@ -187,8 +414,15 @@ func (c *Connection) WriteFrame(frame *Frame) error {
 	return c.writeFrame(frame)
 }
 
-// writeFrame internal frame writing with flow control enforcement
+// writeFrame internal frame writing with flow control enforcement and ordering guarantee
 func (c *Connection) writeFrame(frame *Frame) error {
+	// Check connection state
+	select {
+	case <-c.closeChan:
+		return fmt.Errorf("connection is closed")
+	default:
+	}
+
 	// Enforce flow control for DATA frames as per RFC 7540 Section 6.9
 	if frame.Type == FrameTypeDATA && len(frame.Payload) > 0 {
 		if err := c.checkFlowControl(frame); err != nil {
@@ -387,31 +621,49 @@ func (c *Connection) handleSettingsFrame(frame *Frame) error {
 
 		// Apply specific setting validations
 		switch id {
+		case SettingsMaxConcurrentStreams:
+			// Update concurrent streams limit - RFC 7540 Section 5.1.2
+			oldMax := c.peerSettings[id]
+			if oldMax == 0 {
+				oldMax = 100 // Default
+			}
+			c.peerSettings[id] = value
+			c.settingsMu.Unlock() // Release lock before calling updateMaxConcurrentStreams
+			c.updateMaxConcurrentStreams(value, oldMax)
+			c.settingsMu.Lock() // Re-acquire lock
+			continue
+
 		case SettingsInitialWindowSize:
 			if value > 0x7FFFFFFF {
 				c.settingsMu.Unlock()
 				return fmt.Errorf("invalid initial window size: %d", value)
 			}
-			oldValue := c.peerSettings[id]
-			c.peerSettings[id] = value
-			c.settingsMu.Unlock()
-			c.updateInitialWindowSize(int32(value), int32(oldValue))
-			c.settingsMu.Lock()
+
 		case SettingsMaxFrameSize:
 			if value < 16384 || value > 16777215 {
 				c.settingsMu.Unlock()
 				return fmt.Errorf("invalid max frame size: %d", value)
 			}
-			c.settingsMu.Unlock()
-			c.peerSettings[id] = value
-			c.settingsMu.Lock()
+
 		case SettingsEnablePush:
 			if value != 0 && value != 1 {
 				c.settingsMu.Unlock()
 				return fmt.Errorf("invalid enable push value: %d", value)
 			}
-		case SettingsHeaderTableSize:
+		}
+
+		oldValue := c.peerSettings[id]
+		c.peerSettings[id] = value
+
+		// Apply other setting changes
+		if id == SettingsInitialWindowSize {
+			c.settingsMu.Unlock()
+			c.updateInitialWindowSize(int32(value), int32(oldValue))
+			c.settingsMu.Lock()
+		} else if id == SettingsHeaderTableSize {
+			c.hpackMu.Lock()
 			c.headerDecoder.SetMaxDynamicTableSize(value)
+			c.hpackMu.Unlock()
 		}
 	}
 	c.settingsMu.Unlock()
@@ -419,6 +671,78 @@ func (c *Connection) handleSettingsFrame(frame *Frame) error {
 	// Send SETTINGS ACK
 	ackFrame := c.createSettingsFrame(true)
 	return c.writeFrame(ackFrame)
+}
+
+// updateMaxConcurrentStreams updates the concurrent streams limit
+func (c *Connection) updateMaxConcurrentStreams(newMax, oldMax uint32) {
+	c.concurrencyMu.Lock()
+	defer c.concurrencyMu.Unlock()
+
+	if newMax == 0 {
+		newMax = 100 // Default recommended by RFC 7540
+	}
+
+	c.maxConcurrentStreams = newMax
+
+	// Adjust semaphore capacity
+	delta := int(newMax) - int(oldMax)
+
+	if delta > 0 {
+		// Increase capacity - add more slots
+		for i := 0; i < delta; i++ {
+			select {
+			case c.streamSemaphore <- struct{}{}:
+				// Added slot successfully
+			default:
+				// Channel full, shouldn't happen but handle gracefully
+				break
+			}
+		}
+	} else if delta < 0 {
+		// Decrease capacity - remove slots
+		for i := 0; i < -delta; i++ {
+			select {
+			case <-c.streamSemaphore:
+				// Removed slot successfully
+			default:
+				// No slots to remove
+				break
+			}
+		}
+	}
+}
+
+// createStreamInternal creates a stream internally (assumes locks held)
+func (c *Connection) createStreamInternal(streamID uint32) *Stream {
+	stream := &Stream{
+		ID:           streamID,
+		State:        StreamStateIdle,
+		WindowSize:   c.initialWindowSize,
+		PeerWindow:   c.initialWindowSize,
+		Headers:      make(map[string]string),
+		responseChan: make(chan *StreamResponse, 1),
+		doneChan:     make(chan struct{}),
+	}
+
+	c.streamsMu.Lock()
+	c.streams[streamID] = stream
+	c.streamsMu.Unlock()
+
+	return stream
+}
+
+// GetActiveStreamCount returns current number of active streams
+func (c *Connection) GetActiveStreamCount() int32 {
+	c.concurrencyMu.RLock()
+	defer c.concurrencyMu.RUnlock()
+	return c.activeStreams
+}
+
+// GetMaxConcurrentStreams returns the peer's max concurrent streams setting
+func (c *Connection) GetMaxConcurrentStreams() uint32 {
+	c.concurrencyMu.RLock()
+	defer c.concurrencyMu.RUnlock()
+	return c.maxConcurrentStreams
 }
 
 // updateInitialWindowSize updates all stream windows when INITIAL_WINDOW_SIZE changes
@@ -754,17 +1078,17 @@ func (c *Connection) GetNextStreamID() uint32 {
 
 	if c.isServer {
 		// Server-initiated streams are even
-		c.lastStreamID += 2
+		atomic.AddUint32(&c.lastStreamID, 2)
 	} else {
 		// Client-initiated streams are odd
 		if c.lastStreamID == 0 || c.lastStreamID%2 == 0 {
-			c.lastStreamID += 1
+			atomic.AddUint32(&c.lastStreamID, 1)
 		} else {
-			c.lastStreamID += 2
+			atomic.AddUint32(&c.lastStreamID, 2)
 		}
 	}
 
-	return c.lastStreamID
+	return atomic.LoadUint32(&c.lastStreamID)
 }
 
 // Close gracefully closes the connection
@@ -772,6 +1096,18 @@ func (c *Connection) Close() error {
 	c.closeOnce.Do(func() {
 		close(c.closeChan)
 		c.isClosed = true
+
+		// Close all pending stream requests
+		go func() {
+			for {
+				select {
+				case req := <-c.streamQueue:
+					req.ResponseChan <- &StreamResponse{Error: fmt.Errorf("connection closed")}
+				default:
+					return
+				}
+			}
+		}()
 	})
 	return c.conn.Close()
 }

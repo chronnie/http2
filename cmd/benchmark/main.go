@@ -5,13 +5,17 @@ import (
 	"sync"
 	"time"
 
-	"github.com/chronnie/http2"
+	customHttp2 "github.com/chronnie/http2"
 )
 
-const numberOfRequests = 10
+const numberOfRequests = 1_000
 
 func main() {
-	client, err := http2.NewClient("0.0.0.0:1234")
+	BenchCustomHttp2()
+}
+
+func BenchCustomHttp2() {
+	client, err := customHttp2.NewClient("0.0.0.0:1234")
 	if err != nil {
 		panic(err)
 	}

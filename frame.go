@@ -14,6 +14,18 @@ const (
 	FrameTypeCONTINUATION  = 0x9
 )
 
+// Flags for different frame types
+const (
+	FlagDataEndStream     = 0x1
+	FlagDataPadded        = 0x8
+	FlagHeadersEndStream  = 0x1
+	FlagHeadersEndHeaders = 0x4
+	FlagHeadersPadded     = 0x8
+	FlagHeadersPriority   = 0x20
+	FlagSettingsAck       = 0x1
+	FlagPingAck           = 0x1
+)
+
 // Frame represents an HTTP/2 frame as defined in RFC 7540 Section 4.1
 type Frame struct {
 	Length   uint32 // 24-bit length

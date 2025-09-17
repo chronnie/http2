@@ -19,7 +19,7 @@ func init() {
 // setupLogger initializes zero log based on environment variables
 func setupLogger() {
 	// Get log level from environment variable
-	logLevel := strings.ToLower(os.Getenv("LOG_LEVEL"))
+	logLevel := strings.ToLower(os.Getenv("DEBUG_HTTP2_LOG"))
 
 	var level zerolog.Level
 	switch logLevel {
@@ -36,7 +36,8 @@ func setupLogger() {
 	case "panic":
 		level = zerolog.PanicLevel
 	default:
-		// If LOG_LEVEL is not set or invalid -> disable completely
+		// If DEBUG_HTTP2_LOG is not set or invalid -> disable completely
+		// level = zerolog.DebugLevel
 		level = zerolog.Disabled
 	}
 

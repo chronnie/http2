@@ -1,6 +1,9 @@
 package http2
 
-import "sync"
+import (
+	"context"
+	"sync"
+)
 
 // StreamState represents the state of an HTTP/2 stream as defined in RFC 7540 Section 5.1
 type StreamState int
@@ -29,6 +32,25 @@ type Stream struct {
 	Data      []byte
 	EndStream bool
 
+	// Completion tracking
+	responseChan chan *StreamResponse
+	doneChan     chan struct{}
+
 	// Synchronization
 	mu sync.Mutex
+}
+
+// StreamRequest represents a queued stream creation request
+type StreamRequest struct {
+	StreamID     uint32
+	Headers      map[string]string
+	EndStream    bool
+	ResponseChan chan *StreamResponse
+	Context      context.Context
+}
+
+// StreamResponse represents the response to a stream request
+type StreamResponse struct {
+	Stream *Stream
+	Error  error
 }

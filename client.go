@@ -1,8 +1,11 @@
 package http2
 
 import (
+	"context"
 	"fmt"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -66,12 +69,48 @@ const (
 	HeaderAuthorization = "authorization"
 )
 
-// Client provides high-level HTTP/2 client functionality
-type Client struct {
-	conn *Connection
+// ClientStreamRequest represents a queued stream request to maintain proper ordering
+type ClientStreamRequest struct {
+	req          *Request
+	streamID     uint32
+	responseChan chan *ClientStreamResult
+	ctx          context.Context
 }
 
-// NewClient creates a new HTTP/2 client
+// ClientStreamResult contains the result of a stream request
+type ClientStreamResult struct {
+	response *Response
+	err      error
+}
+
+// Client provides high-level HTTP/2 client functionality with proper concurrent stream management
+type Client struct {
+	conn *Connection
+
+	// *** CONCURRENT STREAM MANAGEMENT ***
+	// RFC 7540 Section 5.1.2 - Proper concurrent streams with HPACK ordering
+
+	// Stream creation serialization to prevent HPACK corruption
+	// This ensures HEADERS frames are sent in proper sequence
+	streamCreationMu sync.Mutex
+
+	// Request queue for batching and ordering
+	requestQueue chan *ClientStreamRequest
+
+	// Active stream tracking for concurrency limits
+	activeStreams        int64 // Atomic counter for active streams
+	maxConcurrentStreams uint32
+
+	// Stream completion tracking
+	streamWaitGroup sync.WaitGroup
+
+	// Background workers
+	requestProcessor *sync.WaitGroup
+	shutdownChan     chan struct{}
+	shutdownOnce     sync.Once
+}
+
+// NewClient creates a new HTTP/2 client with proper concurrent stream management
 func NewClient(address string) (*Client, error) {
 	conn, err := NewConnection(address)
 	if err != nil {
@@ -79,7 +118,11 @@ func NewClient(address string) (*Client, error) {
 	}
 
 	client := &Client{
-		conn: conn,
+		conn:                 conn,
+		requestQueue:         make(chan *ClientStreamRequest, 1000), // Large buffer for high throughput
+		maxConcurrentStreams: 100,                                   // Default limit, will be updated by peer settings
+		requestProcessor:     &sync.WaitGroup{},
+		shutdownChan:         make(chan struct{}),
 	}
 
 	// Start background frame processing
@@ -89,43 +132,134 @@ func NewClient(address string) (*Client, error) {
 		}
 	}()
 
+	numWorkers := 3 // Optimal number for most use cases
+	for i := 0; i < numWorkers; i++ {
+		client.requestProcessor.Add(1)
+		go client.requestWorker(i)
+	}
+
+	// Monitor peer settings for concurrent streams limit updates
+	go client.monitorPeerSettings()
+
 	// Wait a bit for connection establishment
 	time.Sleep(ConnectionSetupDelay)
 
 	return client, nil
 }
 
-// SendRequest sends an HTTP/2 request and waits for the response
-func (c *Client) SendRequest(req *Request) (*Response, error) {
+// requestWorker processes stream requests with proper ordering and concurrency control
+func (c *Client) requestWorker(workerID int) {
+	defer c.requestProcessor.Done()
+
+	for {
+		select {
+		case req := <-c.requestQueue:
+			c.processStreamRequest(req, workerID)
+		case <-c.shutdownChan:
+			return
+		}
+	}
+}
+
+// processStreamRequest handles a single stream request with proper concurrency control
+func (c *Client) processStreamRequest(streamReq *ClientStreamRequest, workerID int) {
+	// Check if we've exceeded concurrent stream limits
+	current := atomic.LoadInt64(&c.activeStreams)
+	if uint32(current) >= c.maxConcurrentStreams {
+		// Wait for available stream slot or timeout
+		ticker := time.NewTicker(10 * time.Millisecond)
+		defer ticker.Stop()
+
+		timeout := time.After(DefaultRequestTimeout)
+		for {
+			select {
+			case <-timeout:
+				streamReq.responseChan <- &ClientStreamResult{
+					err: fmt.Errorf("timeout waiting for available stream slot"),
+				}
+				return
+			case <-ticker.C:
+				current = atomic.LoadInt64(&c.activeStreams)
+				if uint32(current) < c.maxConcurrentStreams {
+					goto proceed
+				}
+			case <-streamReq.ctx.Done():
+				streamReq.responseChan <- &ClientStreamResult{
+					err: streamReq.ctx.Err(),
+				}
+				return
+			case <-c.shutdownChan:
+				streamReq.responseChan <- &ClientStreamResult{
+					err: fmt.Errorf("client shutting down"),
+				}
+				return
+			}
+		}
+	}
+
+proceed:
+	// Increment active stream counter
+	atomic.AddInt64(&c.activeStreams, 1)
+	c.streamWaitGroup.Add(1)
+
+	// Process the request with proper HPACK ordering
+	response, err := c.executeStreamRequest(streamReq)
+
+	// Send result back
+	streamReq.responseChan <- &ClientStreamResult{
+		response: response,
+		err:      err,
+	}
+
+	// Cleanup - decrement active stream counter
+	atomic.AddInt64(&c.activeStreams, -1)
+	c.streamWaitGroup.Done()
+}
+
+// executeStreamRequest executes a stream request with proper HPACK synchronization
+func (c *Client) executeStreamRequest(streamReq *ClientStreamRequest) (*Response, error) {
+	// *** CRITICAL SECTION: HPACK Synchronization ***
+	// RFC 7540 Section 4.3 - HEADERS frames must be processed in order
+	// to maintain consistent HPACK compression state
+	c.streamCreationMu.Lock()
+
 	if c.conn.IsClosed() {
+		c.streamCreationMu.Unlock()
 		return nil, fmt.Errorf("connection is closed")
 	}
 
 	// Validate request
-	if err := c.validateRequest(req); err != nil {
+	if err := c.validateRequest(streamReq.req); err != nil {
+		c.streamCreationMu.Unlock()
 		return nil, fmt.Errorf("invalid request: %w", err)
 	}
 
+	// Get stream ID in proper sequence
 	streamID := c.conn.GetNextStreamID()
 
 	LogStream(streamID, "idle", "sending_request", map[string]interface{}{
-		"method": req.Method,
-		"path":   req.Path,
+		"method": streamReq.req.Method,
+		"path":   streamReq.req.Path,
 	})
 
-	// Create and send HEADERS frame
-	headersFrame, err := c.createHeadersFrame(streamID, req)
+	// Create and send HEADERS frame with proper ordering
+	headersFrame, err := c.createHeadersFrame(streamID, streamReq.req)
 	if err != nil {
+		c.streamCreationMu.Unlock()
 		return nil, fmt.Errorf("failed to create headers frame: %w", err)
 	}
 
 	if err := c.conn.WriteFrame(headersFrame); err != nil {
+		c.streamCreationMu.Unlock()
 		return nil, fmt.Errorf("failed to send headers frame: %w", err)
 	}
 
-	// Send DATA frame(s) if request has body
-	if len(req.Body) > 0 {
-		if err := c.sendDataFrames(streamID, req.Body); err != nil {
+	// Release the critical section - HEADERS frame sent successfully
+	c.streamCreationMu.Unlock()
+
+	// Send DATA frame(s) if request has body (can be done outside critical section)
+	if len(streamReq.req.Body) > 0 {
+		if err := c.sendDataFrames(streamID, streamReq.req.Body); err != nil {
 			return nil, fmt.Errorf("failed to send data frames: %w", err)
 		}
 	}
@@ -133,6 +267,103 @@ func (c *Client) SendRequest(req *Request) (*Response, error) {
 	// Wait for complete response
 	return c.waitForResponse(streamID)
 }
+
+// monitorPeerSettings monitors peer settings changes to update concurrency limits
+func (c *Client) monitorPeerSettings() {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			if maxStreams, exists := c.conn.GetPeerSetting(SettingsMaxConcurrentStreams); exists {
+				if maxStreams > 0 && maxStreams != c.maxConcurrentStreams {
+					c.maxConcurrentStreams = maxStreams
+				}
+			}
+		case <-c.shutdownChan:
+			return
+		}
+	}
+}
+
+// SendRequest sends an HTTP/2 request with proper concurrency management
+func (c *Client) SendRequest(req *Request) (*Response, error) {
+	return c.SendRequestWithContext(context.Background(), req)
+}
+
+// SendRequestWithContext sends an HTTP/2 request with context and proper concurrency management
+func (c *Client) SendRequestWithContext(ctx context.Context, req *Request) (*Response, error) {
+	if c.conn.IsClosed() {
+		return nil, fmt.Errorf("connection is closed")
+	}
+
+	// Create stream request for queuing
+	streamReq := &ClientStreamRequest{
+		req:          req,
+		responseChan: make(chan *ClientStreamResult, 1),
+		ctx:          ctx,
+	}
+
+	// Queue the request for processing
+	select {
+	case c.requestQueue <- streamReq:
+		// Request queued successfully
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-c.shutdownChan:
+		return nil, fmt.Errorf("client shutting down")
+	}
+
+	// Wait for result
+	select {
+	case result := <-streamReq.responseChan:
+		return result.response, result.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-c.shutdownChan:
+		return nil, fmt.Errorf("client shutting down")
+	}
+}
+
+// // SendRequest sends an HTTP/2 request and waits for the response
+// func (c *Client) SendRequest(req *Request) (*Response, error) {
+// 	if c.conn.IsClosed() {
+// 		return nil, fmt.Errorf("connection is closed")
+// 	}
+
+// 	// Validate request
+// 	if err := c.validateRequest(req); err != nil {
+// 		return nil, fmt.Errorf("invalid request: %w", err)
+// 	}
+
+// 	streamID := c.conn.GetNextStreamID()
+
+// 	LogStream(streamID, "idle", "sending_request", map[string]interface{}{
+// 		"method": req.Method,
+// 		"path":   req.Path,
+// 	})
+
+// 	// Create and send HEADERS frame
+// 	headersFrame, err := c.createHeadersFrame(streamID, req)
+// 	if err != nil {
+// 		return nil, fmt.Errorf("failed to create headers frame: %w", err)
+// 	}
+
+// 	if err := c.conn.WriteFrame(headersFrame); err != nil {
+// 		return nil, fmt.Errorf("failed to send headers frame: %w", err)
+// 	}
+
+// 	// Send DATA frame(s) if request has body
+// 	if len(req.Body) > 0 {
+// 		if err := c.sendDataFrames(streamID, req.Body); err != nil {
+// 			return nil, fmt.Errorf("failed to send data frames: %w", err)
+// 		}
+// 	}
+
+// 	// Wait for complete response
+// 	return c.waitForResponse(streamID)
+// }
 
 // validateRequest validates the HTTP/2 request
 func (c *Client) validateRequest(req *Request) error {
@@ -200,7 +431,7 @@ func (c *Client) createHeadersFrame(streamID uint32, req *Request) (*Frame, erro
 		}
 	}
 
-	// Encode headers using HPACK
+	// Encode headers using HPACK (connection handles HPACK synchronization)
 	payload, err := c.conn.headerEncoder.Encode(headers)
 	if err != nil {
 		return nil, fmt.Errorf("HPACK encoding failed: %w", err)
@@ -370,7 +601,7 @@ func parseStatusCode(status string) int {
 	}
 }
 
-// GET sends a GET request
+// GET sends a GET request with automatic concurrency management
 func (c *Client) GET(path, authority string) (*Response, error) {
 	req := &Request{
 		Method:    MethodGET,
@@ -382,7 +613,7 @@ func (c *Client) GET(path, authority string) (*Response, error) {
 	return c.SendRequest(req)
 }
 
-// POST sends a POST request with body
+// POST sends a POST request with body and proper concurrency management
 func (c *Client) POST(path, authority string, body []byte, contentType string) (*Response, error) {
 	headers := make(map[string]string)
 	if contentType != "" {
@@ -400,7 +631,7 @@ func (c *Client) POST(path, authority string, body []byte, contentType string) (
 	return c.SendRequest(req)
 }
 
-// PUT sends a PUT request with body
+// PUT sends a PUT request with body and proper concurrency management
 func (c *Client) PUT(path, authority string, body []byte, contentType string) (*Response, error) {
 	headers := make(map[string]string)
 	if contentType != "" {
@@ -418,7 +649,7 @@ func (c *Client) PUT(path, authority string, body []byte, contentType string) (*
 	return c.SendRequest(req)
 }
 
-// DELETE sends a DELETE request
+// DELETE sends a DELETE request with proper concurrency management
 func (c *Client) DELETE(path, authority string) (*Response, error) {
 	req := &Request{
 		Method:    MethodDELETE,
@@ -430,7 +661,7 @@ func (c *Client) DELETE(path, authority string) (*Response, error) {
 	return c.SendRequest(req)
 }
 
-// HEAD sends a HEAD request
+// HEAD sends a HEAD request with proper concurrency management
 func (c *Client) HEAD(path, authority string) (*Response, error) {
 	req := &Request{
 		Method:    MethodHEAD,
@@ -442,7 +673,7 @@ func (c *Client) HEAD(path, authority string) (*Response, error) {
 	return c.SendRequest(req)
 }
 
-// PATCH sends a PATCH request with body
+// PATCH sends a PATCH request with body and proper concurrency management
 func (c *Client) PATCH(path, authority string, body []byte, contentType string) (*Response, error) {
 	headers := make(map[string]string)
 	if contentType != "" {
@@ -460,7 +691,7 @@ func (c *Client) PATCH(path, authority string, body []byte, contentType string) 
 	return c.SendRequest(req)
 }
 
-// OPTIONS sends an OPTIONS request
+// OPTIONS sends an OPTIONS request with proper concurrency management
 func (c *Client) OPTIONS(path, authority string) (*Response, error) {
 	req := &Request{
 		Method:    MethodOPTIONS,
@@ -472,34 +703,28 @@ func (c *Client) OPTIONS(path, authority string) (*Response, error) {
 	return c.SendRequest(req)
 }
 
-// SetHeader sets a header for subsequent requests (this would be used with a request builder pattern)
-func (req *Request) SetHeader(name, value string) *Request {
-	if req.Headers == nil {
-		req.Headers = make(map[string]string)
-	}
-	req.Headers[name] = value
-	return req
+// GetActiveStreamCount returns the current number of active streams
+func (c *Client) GetActiveStreamCount() int64 {
+	return atomic.LoadInt64(&c.activeStreams)
 }
 
-// AddHeaders adds multiple headers to the request
-func (req *Request) AddHeaders(headers map[string]string) *Request {
-	if req.Headers == nil {
-		req.Headers = make(map[string]string)
-	}
-	for name, value := range headers {
-		req.Headers[name] = value
-	}
-	return req
+// GetMaxConcurrentStreams returns the current max concurrent streams limit
+func (c *Client) GetMaxConcurrentStreams() uint32 {
+	return c.maxConcurrentStreams
 }
 
-// WithBody sets the request body
-func (req *Request) WithBody(body []byte) *Request {
-	req.Body = body
-	return req
-}
-
-// Close closes the client connection
+// Close gracefully closes the client connection
 func (c *Client) Close() error {
+	c.shutdownOnce.Do(func() {
+		close(c.shutdownChan)
+
+		// Wait for all active streams to complete
+		c.streamWaitGroup.Wait()
+
+		// Wait for request processors to finish
+		c.requestProcessor.Wait()
+	})
+
 	if c.conn != nil {
 		return c.conn.Close()
 	}
@@ -528,15 +753,17 @@ func (c *Client) Ping() error {
 	return c.conn.SendPing(pingData)
 }
 
-// GetConnectionInfo returns information about the connection
+// GetConnectionInfo returns comprehensive information about the connection
 func (c *Client) GetConnectionInfo() map[string]interface{} {
 	info := make(map[string]interface{})
 
 	info["connected"] = !c.conn.IsClosed()
 	info["connection_window"] = c.conn.GetConnectionWindow()
 	info["peer_connection_window"] = c.conn.GetPeerConnectionWindow()
+	info["active_streams"] = c.GetActiveStreamCount()
+	info["max_concurrent_streams"] = c.GetMaxConcurrentStreams()
 
-	// Get settings information
+	// Get peer settings information
 	settings := make(map[string]uint32)
 	if maxFrameSize, exists := c.conn.GetPeerSetting(SettingsMaxFrameSize); exists {
 		settings["max_frame_size"] = maxFrameSize
@@ -557,4 +784,30 @@ func (c *Client) GetConnectionInfo() map[string]interface{} {
 	info["peer_settings"] = settings
 
 	return info
+}
+
+// SetHeader sets a header for subsequent requests (this would be used with a request builder pattern)
+func (req *Request) SetHeader(name, value string) *Request {
+	if req.Headers == nil {
+		req.Headers = make(map[string]string)
+	}
+	req.Headers[name] = value
+	return req
+}
+
+// AddHeaders adds multiple headers to the request
+func (req *Request) AddHeaders(headers map[string]string) *Request {
+	if req.Headers == nil {
+		req.Headers = make(map[string]string)
+	}
+	for name, value := range headers {
+		req.Headers[name] = value
+	}
+	return req
+}
+
+// WithBody sets the request body
+func (req *Request) WithBody(body []byte) *Request {
+	req.Body = body
+	return req
 }
