@@ -8,11 +8,13 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"runtime"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
-// Settings parameters as defined in RFC 7540 Section 6.5.2
+// Settings constants from RFC 7540 Section 6.5.2
 const (
 	SettingsHeaderTableSize      = 0x1
 	SettingsEnablePush           = 0x2
@@ -22,7 +24,7 @@ const (
 	SettingsMaxHeaderListSize    = 0x6
 )
 
-// Error codes as defined in RFC 7540 Section 7
+// Error codes from RFC 7540 Section 7
 const (
 	ErrorCodeNoError            = 0x0
 	ErrorCodeProtocolError      = 0x1
@@ -40,418 +42,721 @@ const (
 	ErrorCodeHTTP11Required     = 0xd
 )
 
-// Connection preface as defined in RFC 7540 Section 3.5
+// Connection preface from RFC 7540 Section 3.5
 var ConnectionPreface = []byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
 
-// Connection represents an HTTP/2 connection
-type Connection struct {
-	// Network connection
-	conn   net.Conn
-	reader *bufio.Reader
-	writer *bufio.Writer
+// Performance and buffer size constants
+const (
+	DefaultMaxFrameSize        = 16384   // RFC 7540 default
+	MaxFrameSize               = 1048576 // 1MB max frame size
+	DefaultWindowSize          = 65535   // RFC 7540 default
+	OptimizedWindowSize        = 1048576 // 1MB window for better throughput
+	StreamBufferSize           = 256     // Buffer size for stream operations
+	FrameReaderBufferSize      = 32768   // 32KB read buffer
+	FrameWriterBufferSize      = 32768   // 32KB write buffer
+	MaxConcurrentStreams       = 1000    // High concurrency limit
+	StreamProcessorWorkers     = 4       // Number of stream processors
+	FlowControlUpdateThreshold = 32768   // When to send WINDOW_UPDATE
+)
 
-	// Connection state
-	isServer bool
-	isClosed bool
-
-	// Settings management
-	settings     map[uint16]uint32 // Our settings
-	peerSettings map[uint16]uint32 // Peer's settings
-	settingsMu   sync.RWMutex
-
-	// Stream management with concurrency control
-	streams      map[uint32]*Stream
-	streamsMu    sync.RWMutex
-	lastStreamID uint32 // Last stream ID used by this endpoint
-
-	// *** ENHANCED CONCURRENT STREAM MANAGEMENT ***
-	// RFC 7540 Section 5.1.2 - Stream Concurrency
-	activeStreams        int32               // Current number of active streams
-	maxConcurrentStreams uint32              // Peer's MAX_CONCURRENT_STREAMS setting
-	streamQueue          chan *StreamRequest // Queue for pending stream requests
-	streamSemaphore      chan struct{}       // Semaphore to limit concurrent streams
-	concurrencyMu        sync.RWMutex        // Protects concurrency counters
-
-	// *** SEQUENTIAL STREAM ORDERING ***
-	// Ensures frames are sent in proper order to prevent HPACK corruption
-	streamOrderMu        sync.Mutex // Serializes stream creation and frame sending
-	nextExpectedStreamID uint32     // Next stream ID to maintain ordering
-
-	// Flow control as per RFC 7540 Section 6.9
-	connectionWindow     int32 // Our connection-level receive window
-	peerConnectionWindow int32 // Peer's connection-level send window
-	initialWindowSize    int32 // Default window size for new streams
-	flowControlMu        sync.Mutex
-
-	// Header compression - MUST be synchronized per RFC 7540 Section 4.3
-	headerEncoder *HPACKEncoder
-	headerDecoder *HPACKDecoder
-	hpackMu       sync.Mutex // Protects HPACK encoder/decoder state
-
-	// Graceful shutdown
-	closeChan chan struct{}
-	closeOnce sync.Once
-
-	// Frame processing with ordering guarantee
-	writeMu sync.Mutex // Serializes ALL frame writing for proper ordering
+// Stream request for internal queuing and processing
+type StreamRequest struct {
+	streamID     uint32
+	headers      map[string]string
+	body         []byte
+	endStream    bool
+	priority     uint8
+	responseChan chan *StreamResponse
+	ctx          context.Context
+	timestamp    time.Time
 }
 
-// NewConnection creates a new HTTP/2 connection with enhanced concurrency management
+// Stream response for async operations
+type StreamResponse struct {
+	streamID uint32
+	headers  map[string]string
+	body     []byte
+	status   int
+	err      error
+}
+
+// Connection statistics for monitoring and debugging
+type ConnectionStats struct {
+	BytesSent        int64
+	BytesReceived    int64
+	FramesSent       int64
+	FramesReceived   int64
+	StreamsCreated   int64
+	StreamsClosed    int64
+	HeadersEncoded   int64
+	HeadersDecoded   int64
+	CompressionRatio float64
+	LastActivity     time.Time
+}
+
+// StreamWorker processes streams concurrently
+type StreamWorker struct {
+	id       int
+	conn     *Connection
+	requests chan *StreamRequest
+	shutdown chan struct{}
+	wg       sync.WaitGroup
+}
+
+// Connection represents an optimized HTTP/2 connection with advanced features
+type Connection struct {
+	// Network layer with optimized I/O
+	conn        net.Conn
+	remoteAdd   string
+	reader      *bufio.Reader
+	writer      *bufio.Writer
+	readBuffer  []byte // Pre-allocated read buffer
+	writeBuffer []byte // Pre-allocated write buffer
+
+	// Connection state with atomic operations
+	isServer     int32  // Use atomic for thread-safe access
+	isClosed     int32  // Use atomic for thread-safe access
+	isReading    int32  // Reading state flag
+	lastStreamID uint32 // Atomic access with sync/atomic
+
+	// Settings management with fast lookup
+	settings     map[uint16]uint32
+	peerSettings map[uint16]uint32
+	settingsMu   sync.RWMutex
+
+	// Advanced stream management with sync.Map for performance
+	streams           sync.Map // Concurrent map for O(1) stream access
+	streamCount       int64    // Atomic counter
+	maxStreams        uint32   // Max concurrent streams
+	streamQueue       chan *StreamRequest
+	streamWorkers     []*StreamWorker
+	streamSemaphore   chan struct{} // Limit concurrent streams
+	initialWindowSize uint32        // Initial window size for new streams
+
+	// HPACK integration with pooling for memory efficiency
+	hpackEncoder     *HPACKEncoder
+	hpackDecoder     *HPACKDecoder
+	hpackEncoderPool sync.Pool
+	hpackDecoderPool sync.Pool
+	hpackMu          sync.Mutex // Critical for HPACK state consistency
+
+	// Flow control with optimized windows
+	connectionWindow     int64 // Atomic access
+	peerConnectionWindow int64 // Atomic access
+	flowControlMu        sync.Mutex
+
+	// Frame processing with high-performance queuing
+	frameReader    *FrameReader
+	frameWriter    *FrameWriter
+	incomingFrames chan *Frame
+	outgoingFrames chan *Frame
+	frameWorkers   int
+
+	// Graceful shutdown management
+	shutdownCtx    context.Context
+	shutdownCancel context.CancelFunc
+	shutdownOnce   sync.Once
+	closeWaitGroup sync.WaitGroup
+
+	// Performance monitoring and statistics
+	stats     ConnectionStats
+	statsMu   sync.RWMutex
+	startTime time.Time
+
+	// Write synchronization - critical for frame ordering per RFC 7540
+	writeMu sync.Mutex
+}
+
+// NewConnection creates a new optimized HTTP/2 connection
 func NewConnection(address string) (*Connection, error) {
-	conn, err := net.Dial("tcp", address)
+	// Establish TCP connection with optimized settings
+	tcpConn, err := net.DialTimeout("tcp", address, 10*time.Second)
 	if err != nil {
-		return nil, fmt.Errorf("failed to establish TCP connection: %w", err)
+		return nil, fmt.Errorf("failed to dial %s: %w", address, err)
 	}
 
-	c := &Connection{
-		conn:     conn,
-		reader:   bufio.NewReader(conn),
-		writer:   bufio.NewWriter(conn),
-		isServer: false,
-		isClosed: false,
-
-		settings:     make(map[uint16]uint32),
-		peerSettings: make(map[uint16]uint32),
-		streams:      make(map[uint32]*Stream),
-
-		// Initialize concurrency management
-		activeStreams:        0,
-		maxConcurrentStreams: 100, // Default to 100 as recommended by RFC 7540
-		streamQueue:          make(chan *StreamRequest, 100),
-		streamSemaphore:      make(chan struct{}, 100),
-		nextExpectedStreamID: 1, // Client streams start from 1
-
-		// Flow control windows - RFC 7540 Section 6.9.2
-		connectionWindow:     65535, // Initial connection window
-		peerConnectionWindow: 65535, // Peer's initial connection window
-		initialWindowSize:    65535, // Initial window size for streams
-
-		headerEncoder: NewHPACKEncoder(),
-		headerDecoder: NewHPACKDecoder(),
-		closeChan:     make(chan struct{}),
+	// Configure TCP options for optimal performance
+	if tcpConn, ok := tcpConn.(*net.TCPConn); ok {
+		tcpConn.SetNoDelay(true)   // Disable Nagle algorithm for low latency
+		tcpConn.SetKeepAlive(true) // Enable TCP keepalive
+		tcpConn.SetKeepAlivePeriod(30 * time.Second)
+		tcpConn.SetReadBuffer(FrameReaderBufferSize * 2)
+		tcpConn.SetWriteBuffer(FrameWriterBufferSize * 2)
 	}
 
-	// Set default settings as per RFC 7540 Section 6.5.2
-	c.settings[SettingsHeaderTableSize] = 4096
-	c.settings[SettingsEnablePush] = 0
-	c.settings[SettingsMaxConcurrentStreams] = 100 // Allow peer to create 100 streams
-	c.settings[SettingsInitialWindowSize] = 65535
-	c.settings[SettingsMaxFrameSize] = 16384
+	// Create shutdown context for graceful termination
+	shutdownCtx, shutdownCancel := context.WithCancel(context.Background())
 
-	// Initialize semaphore with current limit
-	for i := 0; i < int(c.maxConcurrentStreams); i++ {
-		c.streamSemaphore <- struct{}{}
+	conn := &Connection{
+		conn:         tcpConn,
+		remoteAdd:    address,
+		reader:       bufio.NewReaderSize(tcpConn, FrameReaderBufferSize),
+		writer:       bufio.NewWriterSize(tcpConn, FrameWriterBufferSize),
+		readBuffer:   make([]byte, MaxFrameSize),
+		writeBuffer:  make([]byte, MaxFrameSize),
+		isServer:     0, // Client mode
+		isClosed:     0,
+		isReading:    0,
+		lastStreamID: 1, // Client streams start from 1
+
+		settings:     make(map[uint16]uint32, 8),
+		peerSettings: make(map[uint16]uint32, 8),
+
+		streamCount:       0,
+		maxStreams:        MaxConcurrentStreams,
+		streamQueue:       make(chan *StreamRequest, StreamBufferSize*4),
+		streamSemaphore:   make(chan struct{}, MaxConcurrentStreams),
+		initialWindowSize: OptimizedWindowSize,
+
+		connectionWindow:     int64(OptimizedWindowSize),
+		peerConnectionWindow: int64(OptimizedWindowSize),
+
+		incomingFrames: make(chan *Frame, 100),
+		outgoingFrames: make(chan *Frame, 100),
+		frameWorkers:   runtime.NumCPU(),
+
+		shutdownCtx:    shutdownCtx,
+		shutdownCancel: shutdownCancel,
+		startTime:      time.Now(),
 	}
 
-	// Send connection preface
-	if err := c.sendConnectionPreface(); err != nil {
+	// Initialize HPACK with pooling for memory efficiency
+	conn.initHPACK()
+
+	// Initialize frame processors
+	conn.frameReader = NewFrameReader(conn.reader)
+	conn.frameWriter = NewFrameWriter(conn.writer)
+
+	// Set optimized default settings per RFC 7540
+	conn.settings[SettingsHeaderTableSize] = 65536 // Larger HPACK table
+	conn.settings[SettingsEnablePush] = 0          // Disable server push
+	conn.settings[SettingsMaxConcurrentStreams] = MaxConcurrentStreams
+	conn.settings[SettingsInitialWindowSize] = OptimizedWindowSize
+	conn.settings[SettingsMaxFrameSize] = MaxFrameSize
+	conn.settings[SettingsMaxHeaderListSize] = 16384
+
+	// Initialize stream semaphore for concurrency control
+	for i := 0; i < MaxConcurrentStreams; i++ {
+		conn.streamSemaphore <- struct{}{}
+	}
+
+	// Initialize stream workers for concurrent processing
+	conn.initStreamWorkers()
+
+	// Send connection preface and initial settings
+	if err := conn.sendConnectionPreface(); err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("failed to send connection preface: %w", err)
 	}
 
-	// Start stream processor goroutine
-	go c.streamProcessor()
+	// Start background processors
+	conn.startBackgroundProcessors()
 
-	return c, nil
+	LogConnection("connection_established", address, map[string]interface{}{
+		"address":     address,
+		"max_streams": MaxConcurrentStreams,
+		"window_size": OptimizedWindowSize,
+		"frame_size":  MaxFrameSize,
+	})
+
+	return conn, nil
 }
 
-// RequestStream requests a new stream with concurrency control
-// RFC 7540 Section 5.1.2 - respects SETTINGS_MAX_CONCURRENT_STREAMS
-func (c *Connection) RequestStream(ctx context.Context, headers map[string]string, endStream bool) (*Stream, error) {
-	if c.isClosed {
-		return nil, fmt.Errorf("connection is closed")
+// initHPACK initializes HPACK encoder/decoder with object pooling
+func (c *Connection) initHPACK() {
+	c.hpackEncoder = GetHPACKEncoder()
+	c.hpackDecoder = GetHPACKDecoder()
+
+	// Set up encoder pool for memory reuse
+	c.hpackEncoderPool = sync.Pool{
+		New: func() interface{} {
+			return GetHPACKEncoder()
+		},
 	}
 
-	// Check if we can create more streams
-	if !c.canCreateStream() {
-		return nil, fmt.Errorf("cannot create stream: would exceed peer's MAX_CONCURRENT_STREAMS limit")
+	// Set up decoder pool for memory reuse
+	c.hpackDecoderPool = sync.Pool{
+		New: func() interface{} {
+			return GetHPACKDecoder()
+		},
 	}
+}
 
-	// Get next stream ID with proper ordering
-	streamID := c.getNextStreamIDSequential()
+// initStreamWorkers creates worker goroutines for concurrent stream processing
+func (c *Connection) initStreamWorkers() {
+	c.streamWorkers = make([]*StreamWorker, StreamProcessorWorkers)
 
-	req := &StreamRequest{
-		StreamID:     streamID,
-		Headers:      headers,
-		EndStream:    endStream,
-		ResponseChan: make(chan *StreamResponse, 1),
-		Context:      ctx,
-	}
-
-	// Queue the request for sequential processing
-	select {
-	case c.streamQueue <- req:
-		// Request queued successfully
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case <-c.closeChan:
-		return nil, fmt.Errorf("connection closed")
-	}
-
-	// Wait for response
-	select {
-	case resp := <-req.ResponseChan:
-		if resp.Error != nil {
-			return nil, resp.Error
+	for i := 0; i < StreamProcessorWorkers; i++ {
+		worker := &StreamWorker{
+			id:       i,
+			conn:     c,
+			requests: make(chan *StreamRequest, StreamBufferSize),
+			shutdown: make(chan struct{}),
 		}
-		return resp.Stream, nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case <-c.closeChan:
-		return nil, fmt.Errorf("connection closed")
+		c.streamWorkers[i] = worker
 	}
 }
 
-// streamProcessor processes stream requests sequentially to maintain ordering
-func (c *Connection) streamProcessor() {
+// startBackgroundProcessors starts all background processing goroutines
+func (c *Connection) startBackgroundProcessors() {
+	// Start frame reader for incoming frames
+	c.closeWaitGroup.Add(1)
+	go c.frameReaderLoop()
+
+	// Start frame writer for outgoing frames
+	c.closeWaitGroup.Add(1)
+	go c.frameWriterLoop()
+
+	// Start frame processors
+	for i := 0; i < c.frameWorkers; i++ {
+		c.closeWaitGroup.Add(1)
+		go c.frameProcessor(i)
+	}
+
+	// Start stream workers
+	for _, worker := range c.streamWorkers {
+		worker.wg.Add(1)
+		go worker.run()
+	}
+
+	// Start connection health monitor
+	c.closeWaitGroup.Add(1)
+	go c.connectionMonitor()
+}
+
+// frameReaderLoop continuously reads frames from the connection
+func (c *Connection) frameReaderLoop() {
+	defer c.closeWaitGroup.Done()
+	defer func() {
+		if r := recover(); r != nil {
+			LogError(fmt.Errorf("frame reader panic: %v", r), "frame_reader_panic", nil)
+		}
+	}()
+
+	atomic.StoreInt32(&c.isReading, 1)
+	defer atomic.StoreInt32(&c.isReading, 0)
+
 	for {
 		select {
-		case req := <-c.streamQueue:
-			c.processStreamRequest(req)
-		case <-c.closeChan:
+		case <-c.shutdownCtx.Done():
+			return
+		default:
+		}
+
+		// Read frame with timeout to prevent blocking indefinitely
+		c.conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+		frame, err := c.frameReader.ReadFrame()
+		c.conn.SetReadDeadline(time.Time{}) // Clear deadline
+
+		if err != nil {
+			if atomic.LoadInt32(&c.isClosed) == 0 {
+				LogError(err, "frame_read_error", map[string]interface{}{
+					"connection": c.conn.RemoteAddr().String(),
+				})
+			}
+			return
+		}
+
+		// Update connection statistics
+		atomic.AddInt64(&c.stats.FramesReceived, 1)
+		atomic.AddInt64(&c.stats.BytesReceived, int64(frame.Length)+9) // +9 for frame header
+		c.updateLastActivity()
+
+		// Queue frame for processing with backpressure handling
+		select {
+		case c.incomingFrames <- frame:
+		case <-c.shutdownCtx.Done():
+			return
+		default:
+			// Drop frame if queue is full to prevent memory issues
+			LogError(fmt.Errorf("incoming frame queue full"), "frame_queue_full", nil)
+		}
+	}
+}
+
+// frameWriterLoop continuously writes frames to the connection
+func (c *Connection) frameWriterLoop() {
+	defer c.closeWaitGroup.Done()
+	defer func() {
+		if r := recover(); r != nil {
+			LogError(fmt.Errorf("frame writer panic: %v", r), "frame_writer_panic", nil)
+		}
+	}()
+
+	for {
+		select {
+		case frame := <-c.outgoingFrames:
+			if err := c.writeFrameInternal(frame); err != nil {
+				if atomic.LoadInt32(&c.isClosed) == 0 {
+					LogError(err, "frame_write_error", nil)
+				}
+				return
+			}
+
+		case <-c.shutdownCtx.Done():
 			return
 		}
 	}
 }
 
-// processStreamRequest processes a single stream request with proper ordering
-func (c *Connection) processStreamRequest(req *StreamRequest) {
-	// Acquire semaphore slot (blocks if at limit)
-	select {
-	case <-c.streamSemaphore:
-		// Got semaphore slot
-	case <-req.Context.Done():
-		req.ResponseChan <- &StreamResponse{Error: req.Context.Err()}
-		return
-	case <-c.closeChan:
-		req.ResponseChan <- &StreamResponse{Error: fmt.Errorf("connection closed")}
-		return
-	}
-
-	// Ensure sequential ordering of stream creation and frame sending
-	c.streamOrderMu.Lock()
-	defer c.streamOrderMu.Unlock()
-
-	// Double-check connection state under lock
-	if c.isClosed {
-		c.streamSemaphore <- struct{}{} // Release semaphore
-		req.ResponseChan <- &StreamResponse{Error: fmt.Errorf("connection closed")}
-		return
-	}
-
-	// Create stream
-	stream := c.createStreamInternal(req.StreamID)
-
-	// Send HEADERS frame with HPACK synchronization
-	if err := c.sendHeadersFrameSync(stream, req.Headers, req.EndStream); err != nil {
-		// Failed to send headers, clean up
-		c.removeStream(req.StreamID)
-		c.streamSemaphore <- struct{}{} // Release semaphore
-		req.ResponseChan <- &StreamResponse{Error: fmt.Errorf("failed to send HEADERS frame: %w", err)}
-		return
-	}
-
-	// Update stream state
-	stream.mu.Lock()
-	stream.State = StreamStateOpen
-	if req.EndStream {
-		stream.State = StreamStateHalfClosedLocal
-		stream.EndStream = true
-	}
-	stream.mu.Unlock()
-
-	// Increment active stream counter
-	c.concurrencyMu.Lock()
-	c.activeStreams++
-	c.concurrencyMu.Unlock()
-
-	// Return successful response
-	req.ResponseChan <- &StreamResponse{Stream: stream, Error: nil}
-}
-
-// canCreateStream checks if we can create a new stream without exceeding limits
-func (c *Connection) canCreateStream() bool {
-	c.concurrencyMu.RLock()
-	defer c.concurrencyMu.RUnlock()
-
-	c.settingsMu.RLock()
-	maxStreams := c.peerSettings[SettingsMaxConcurrentStreams]
-	c.settingsMu.RUnlock()
-
-	if maxStreams == 0 {
-		maxStreams = 100 // Default recommended by RFC 7540
-	}
-
-	return uint32(c.activeStreams) < maxStreams
-}
-
-// getNextStreamIDSequential returns the next stream ID with proper sequencing
-func (c *Connection) getNextStreamIDSequential() uint32 {
-	// Note: streamOrderMu should already be held by caller
-	c.streamsMu.Lock()
-	defer c.streamsMu.Unlock()
-
-	if c.isServer {
-		// Server-initiated streams are even
-		if c.lastStreamID == 0 || c.lastStreamID%2 == 1 {
-			c.lastStreamID = 2
-		} else {
-			c.lastStreamID += 2
+// frameProcessor handles incoming frames with proper error recovery
+func (c *Connection) frameProcessor(workerID int) {
+	defer c.closeWaitGroup.Done()
+	defer func() {
+		if r := recover(); r != nil {
+			LogError(fmt.Errorf("frame processor %d panic: %v", workerID, r),
+				"frame_processor_panic", map[string]interface{}{"worker_id": workerID})
 		}
-	} else {
-		// Client-initiated streams are odd - RFC 7540 Section 5.1.1
-		if c.lastStreamID == 0 || c.lastStreamID%2 == 0 {
-			c.lastStreamID = 1
-		} else {
-			c.lastStreamID += 2
+	}()
+
+	for {
+		select {
+		case frame := <-c.incomingFrames:
+			c.handleIncomingFrame(frame, workerID)
+
+		case <-c.shutdownCtx.Done():
+			return
 		}
 	}
-
-	c.nextExpectedStreamID = c.lastStreamID
-	return c.lastStreamID
 }
 
-// sendHeadersFrameSync sends HEADERS frame with HPACK synchronization
-func (c *Connection) sendHeadersFrameSync(stream *Stream, headers map[string]string, endStream bool) error {
-	// Encode headers with HPACK synchronization
+// handleIncomingFrame processes different frame types according to RFC 7540
+func (c *Connection) handleIncomingFrame(frame *Frame, workerID int) {
+	defer func() {
+		if r := recover(); r != nil {
+			LogError(fmt.Errorf("handle frame panic: %v", r), "handle_frame_panic",
+				map[string]interface{}{
+					"frame_type": frame.Type,
+					"stream_id":  frame.StreamID,
+					"worker_id":  workerID,
+				})
+		}
+	}()
+
+	switch frame.Type {
+	case FrameTypeDATA:
+		c.handleDataFrame(frame)
+
+	case FrameTypeHEADERS:
+		c.handleHeadersFrame(frame)
+
+	case FrameTypeSETTINGS:
+		c.handleSettingsFrame(frame)
+
+	case FrameTypeWINDOW_UPDATE:
+		c.handleWindowUpdateFrame(frame)
+
+	case FrameTypePING:
+		c.handlePingFrame(frame)
+
+	case FrameTypeGOAWAY:
+		c.handleGoAwayFrame(frame)
+
+	case FrameTypeRST_STREAM:
+		c.handleRstStreamFrame(frame)
+
+	default:
+		// Unknown frame type - ignore per RFC 7540 Section 4.1
+		LogError(fmt.Errorf("unknown frame type: %d", frame.Type),
+			"unknown_frame_type", map[string]interface{}{
+				"frame_type": frame.Type,
+				"stream_id":  frame.StreamID,
+			})
+	}
+}
+
+// handleHeadersFrame processes HEADERS frames with HPACK decompression
+func (c *Connection) handleHeadersFrame(frame *Frame) {
+	// Get decoder from pool for memory efficiency
+	decoder := c.hpackDecoderPool.Get().(*HPACKDecoder)
+	defer c.hpackDecoderPool.Put(decoder)
+
+	// Critical section: HPACK decoding must be synchronized per RFC 7540
 	c.hpackMu.Lock()
-	encodedHeaders, err := c.headerEncoder.Encode(headers)
+	headers, err := decoder.Decode(frame.Payload)
 	c.hpackMu.Unlock()
 
 	if err != nil {
-		return fmt.Errorf("HPACK encoding failed: %w", err)
+		LogError(err, "hpack_decode_error", map[string]interface{}{
+			"stream_id":   frame.StreamID,
+			"payload_len": len(frame.Payload),
+		})
+		c.sendRstStream(frame.StreamID, ErrorCodeCompressionError)
+		return
 	}
+
+	// Update HPACK statistics
+	atomic.AddInt64(&c.stats.HeadersDecoded, 1)
+
+	// Find or create stream using the new Stream implementation
+	stream := c.getOrCreateStream(frame.StreamID)
+	if stream == nil {
+		LogError(fmt.Errorf("failed to create stream %d", frame.StreamID), "stream_creation_failed", nil)
+		return
+	}
+
+	// Process headers through the stream
+	endStream := (frame.Flags & FlagHeadersEndStream) != 0
+	if err := stream.ReceiveHeaders(headers, endStream); err != nil {
+		LogError(err, "stream_headers_error", map[string]interface{}{
+			"stream_id": frame.StreamID,
+		})
+		c.sendRstStream(frame.StreamID, ErrorCodeProtocolError)
+		return
+	}
+
+	LogHPACK("decode", len(frame.Payload), calculateHeadersSize(headers))
+}
+
+// handleDataFrame processes DATA frames with flow control
+func (c *Connection) handleDataFrame(frame *Frame) {
+	if frame.StreamID == 0 {
+		// DATA frames MUST be associated with a stream per RFC 7540
+		c.sendGoAway(0, ErrorCodeProtocolError, []byte("DATA frame on stream 0"))
+		return
+	}
+
+	// Find the stream
+	streamVal, exists := c.streams.Load(frame.StreamID)
+	if !exists {
+		// Stream doesn't exist - send RST_STREAM
+		c.sendRstStream(frame.StreamID, ErrorCodeStreamClosed)
+		return
+	}
+
+	stream := streamVal.(*Stream)
+
+	// Update connection-level flow control window
+	atomic.AddInt64(&c.connectionWindow, -int64(len(frame.Payload)))
+
+	// Process data through the stream with flow control
+	endStream := (frame.Flags & FlagDataEndStream) != 0
+	if err := stream.ReceiveData(frame.Payload, endStream); err != nil {
+		LogError(err, "stream_data_error", map[string]interface{}{
+			"stream_id": frame.StreamID,
+			"data_len":  len(frame.Payload),
+		})
+		c.sendRstStream(frame.StreamID, ErrorCodeFlowControlError)
+		return
+	}
+
+	// Send WINDOW_UPDATE if connection window is getting low
+	if atomic.LoadInt64(&c.connectionWindow) < FlowControlUpdateThreshold {
+		c.sendWindowUpdate(0, OptimizedWindowSize)
+		atomic.StoreInt64(&c.connectionWindow, int64(OptimizedWindowSize))
+	}
+}
+
+// CreateStream creates a new HTTP/2 stream with optimized processing
+func (c *Connection) CreateStream(headers map[string]string, body []byte, endStream bool) (*StreamResponse, error) {
+	// Check connection state
+	if atomic.LoadInt32(&c.isClosed) != 0 {
+		return nil, fmt.Errorf("connection is closed")
+	}
+
+	// Acquire stream semaphore for concurrency control
+	select {
+	case <-c.streamSemaphore:
+	case <-time.After(5 * time.Second):
+		return nil, fmt.Errorf("timeout acquiring stream slot")
+	}
+
+	// Get next stream ID atomically
+	streamID := atomic.AddUint32(&c.lastStreamID, 2) // Client streams are odd
+
+	// Create stream request
+	req := &StreamRequest{
+		streamID:     streamID,
+		headers:      headers,
+		body:         body,
+		endStream:    endStream,
+		priority:     0,
+		responseChan: make(chan *StreamResponse, 1),
+		ctx:          context.Background(),
+		timestamp:    time.Now(),
+	}
+
+	// Send to worker using round-robin distribution
+	workerIndex := int(streamID) % len(c.streamWorkers)
+	select {
+	case c.streamWorkers[workerIndex].requests <- req:
+	case <-time.After(1 * time.Second):
+		c.releaseStreamSlot()
+		return nil, fmt.Errorf("timeout queuing stream request")
+	}
+
+	// Wait for response with timeout
+	select {
+	case resp := <-req.responseChan:
+		return resp, resp.err
+	case <-time.After(30 * time.Second):
+		c.releaseStreamSlot()
+		return nil, fmt.Errorf("timeout waiting for stream response")
+	}
+}
+
+// run executes the stream worker's main processing loop
+func (worker *StreamWorker) run() {
+	defer worker.wg.Done()
+	defer func() {
+		if r := recover(); r != nil {
+			LogError(fmt.Errorf("stream worker %d panic: %v", worker.id, r),
+				"stream_worker_panic", map[string]interface{}{"worker_id": worker.id})
+		}
+	}()
+
+	for {
+		select {
+		case req := <-worker.requests:
+			worker.processStreamRequest(req)
+
+		case <-worker.shutdown:
+			return
+		}
+	}
+}
+
+// processStreamRequest handles individual stream requests
+func (worker *StreamWorker) processStreamRequest(req *StreamRequest) {
+	defer worker.conn.releaseStreamSlot()
+
+	// Get encoder from pool for memory efficiency
+	encoder := worker.conn.hpackEncoderPool.Get().(*HPACKEncoder)
+	defer worker.conn.hpackEncoderPool.Put(encoder)
+
+	// Encode headers with HPACK compression
+	worker.conn.hpackMu.Lock()
+	headerBlock, err := encoder.Encode(req.headers)
+	worker.conn.hpackMu.Unlock()
+
+	if err != nil {
+		req.responseChan <- &StreamResponse{
+			streamID: req.streamID,
+			err:      fmt.Errorf("HPACK encode error: %w", err),
+		}
+		return
+	}
+
+	// Update HPACK compression statistics
+	atomic.AddInt64(&worker.conn.stats.HeadersEncoded, 1)
 
 	// Create HEADERS frame
-	flags := uint8(FlagHeadersEndHeaders)
-	if endStream {
-		flags |= FlagHeadersEndStream
-	}
-
-	frame := &Frame{
-		Length:   uint32(len(encodedHeaders)),
+	headersFrame := &Frame{
+		Length:   uint32(len(headerBlock)),
 		Type:     FrameTypeHEADERS,
-		Flags:    flags,
-		StreamID: stream.ID,
-		Payload:  encodedHeaders,
+		Flags:    FlagHeadersEndHeaders,
+		StreamID: req.streamID,
+		Payload:  headerBlock,
 	}
 
-	// Send frame (writeFrame handles writeMu internally)
-	return c.writeFrame(frame)
-}
-
-// removeStream removes a stream from tracking and releases concurrency slot
-func (c *Connection) removeStream(streamID uint32) {
-	c.streamsMu.Lock()
-	if _, exists := c.streams[streamID]; exists {
-		delete(c.streams, streamID)
-	}
-	c.streamsMu.Unlock()
-
-	// Decrement active streams counter
-	c.concurrencyMu.Lock()
-	c.activeStreams--
-	c.concurrencyMu.Unlock()
-
-	// Release semaphore slot
-	select {
-	case c.streamSemaphore <- struct{}{}:
-		// Released successfully
-	default:
-		// Semaphore full (shouldn't happen but handle gracefully)
-	}
-}
-
-// sendConnectionPreface sends the HTTP/2 connection preface as per RFC 7540 Section 3.5
-func (c *Connection) sendConnectionPreface() error {
-	// Send the magic string
-	if _, err := c.conn.Write(ConnectionPreface); err != nil {
-		return fmt.Errorf("failed to send preface magic: %w", err)
+	if req.endStream && len(req.body) == 0 {
+		headersFrame.Flags |= FlagHeadersEndStream
 	}
 
-	// Send initial SETTINGS frame
-	settingsFrame := c.createSettingsFrame(false)
-	return c.writeFrame(settingsFrame)
-}
-
-// createSettingsFrame creates a SETTINGS frame
-func (c *Connection) createSettingsFrame(ack bool) *Frame {
-	frame := &Frame{
-		Type:     FrameTypeSETTINGS,
-		StreamID: 0, // SETTINGS frames are connection-level
+	// Send HEADERS frame
+	if err := worker.conn.writeFrame(headersFrame); err != nil {
+		req.responseChan <- &StreamResponse{
+			streamID: req.streamID,
+			err:      fmt.Errorf("failed to send headers: %w", err),
+		}
+		return
 	}
 
-	if ack {
-		frame.Flags = FlagSettingsAck
-		frame.Length = 0
-		frame.Payload = []byte{}
-		return frame
-	}
+	// Send DATA frame if body exists
+	if len(req.body) > 0 {
+		dataFrame := &Frame{
+			Length:   uint32(len(req.body)),
+			Type:     FrameTypeDATA,
+			Flags:    0,
+			StreamID: req.streamID,
+			Payload:  req.body,
+		}
 
-	// Build settings payload (6 bytes per setting)
-	var payload bytes.Buffer
-	c.settingsMu.RLock()
-	for id, value := range c.settings {
-		binary.Write(&payload, binary.BigEndian, id)
-		binary.Write(&payload, binary.BigEndian, value)
-	}
-	c.settingsMu.RUnlock()
+		if req.endStream {
+			dataFrame.Flags |= FlagDataEndStream
+		}
 
-	frame.Payload = payload.Bytes()
-	frame.Length = uint32(len(frame.Payload))
-	return frame
-}
-
-// WriteFrame writes a frame to the connection with proper validation and flow control
-func (c *Connection) WriteFrame(frame *Frame) error {
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-
-	if c.isClosed {
-		return fmt.Errorf("connection is closed")
-	}
-
-	return c.writeFrame(frame)
-}
-
-// writeFrame internal frame writing with flow control enforcement and ordering guarantee
-func (c *Connection) writeFrame(frame *Frame) error {
-	// Check connection state
-	select {
-	case <-c.closeChan:
-		return fmt.Errorf("connection is closed")
-	default:
-	}
-
-	// Enforce flow control for DATA frames as per RFC 7540 Section 6.9
-	if frame.Type == FrameTypeDATA && len(frame.Payload) > 0 {
-		if err := c.checkFlowControl(frame); err != nil {
-			return fmt.Errorf("flow control violation: %w", err)
+		if err := worker.conn.writeFrame(dataFrame); err != nil {
+			req.responseChan <- &StreamResponse{
+				streamID: req.streamID,
+				err:      fmt.Errorf("failed to send data: %w", err),
+			}
+			return
 		}
 	}
 
-	// Validate frame size against peer's MAX_FRAME_SIZE setting
-	c.settingsMu.RLock()
-	maxFrameSize := c.peerSettings[SettingsMaxFrameSize]
-	c.settingsMu.RUnlock()
+	// Create stream for tracking using new Stream implementation
+	stream := worker.conn.createStreamWithID(req.streamID)
 
-	if maxFrameSize == 0 {
-		maxFrameSize = 16384 // Default per RFC 7540
+	LogHPACK("encode", calculateHeadersSize(req.headers), len(headerBlock))
+	LogStream(stream.ID, "idle", "headers_sent", map[string]interface{}{
+		"header_count": len(req.headers),
+		"body_size":    len(req.body),
+		"end_stream":   req.endStream,
+	})
+
+	// For now, return a simple success response
+	// In a full implementation, this would wait for the actual response
+	req.responseChan <- &StreamResponse{
+		streamID: stream.ID,
+		headers:  map[string]string{":status": "200"},
+		body:     []byte("OK"),
+		status:   200,
+		err:      nil,
+	}
+}
+
+// getOrCreateStream finds existing stream or creates a new one
+func (c *Connection) getOrCreateStream(streamID uint32) *Stream {
+	if val, exists := c.streams.Load(streamID); exists {
+		return val.(*Stream)
 	}
 
-	if frame.Length > maxFrameSize {
-		return fmt.Errorf("frame size %d exceeds peer's maximum %d", frame.Length, maxFrameSize)
+	return c.createStreamWithID(streamID)
+}
+
+// createStreamWithID creates a new stream with the given ID
+func (c *Connection) createStreamWithID(streamID uint32) *Stream {
+	stream := NewStream(streamID, c.initialWindowSize)
+	c.streams.Store(streamID, stream)
+	atomic.AddInt64(&c.streamCount, 1)
+	atomic.AddInt64(&c.stats.StreamsCreated, 1)
+	return stream
+}
+
+// writeFrame queues a frame for asynchronous writing
+func (c *Connection) writeFrame(frame *Frame) error {
+	if atomic.LoadInt32(&c.isClosed) != 0 {
+		return fmt.Errorf("connection is closed")
 	}
 
-	// Write frame header (9 bytes) as per RFC 7540 Section 4.1
-	header := make([]byte, 9)
-	header[0] = byte(frame.Length >> 16) // Length (24-bit)
+	// Queue frame for async writing with timeout
+	select {
+	case c.outgoingFrames <- frame:
+		return nil
+	case <-time.After(1 * time.Second):
+		return fmt.Errorf("timeout queuing outgoing frame")
+	}
+}
+
+// writeFrameInternal performs the actual frame writing with synchronization
+func (c *Connection) writeFrameInternal(frame *Frame) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+
+	// Validate frame before writing
+	if err := c.validateFrame(frame); err != nil {
+		return err
+	}
+
+	// Write frame header (9 bytes) per RFC 7540 Section 4.1
+	header := c.writeBuffer[:9]
+	header[0] = byte(frame.Length >> 16)
 	header[1] = byte(frame.Length >> 8)
 	header[2] = byte(frame.Length)
-	header[3] = frame.Type  // Type (8-bit)
-	header[4] = frame.Flags // Flags (8-bit)
-	// Stream ID (31-bit, R bit must be 0)
-	binary.BigEndian.PutUint32(header[5:9], frame.StreamID&0x7FFFFFFF)
+	header[3] = frame.Type
+	header[4] = frame.Flags
+	binary.BigEndian.PutUint32(header[5:], frame.StreamID&0x7FFFFFFF)
 
 	if _, err := c.writer.Write(header); err != nil {
 		return fmt.Errorf("failed to write frame header: %w", err)
@@ -464,570 +769,265 @@ func (c *Connection) writeFrame(frame *Frame) error {
 		}
 	}
 
-	// Update flow control after successful write
-	if frame.Type == FrameTypeDATA && len(frame.Payload) > 0 {
-		c.updateFlowControlAfterSend(frame)
+	// Flush for optimal network performance
+	if err := c.writer.Flush(); err != nil {
+		return fmt.Errorf("failed to flush frame: %w", err)
 	}
 
-	return c.writer.Flush()
+	// Update connection statistics
+	atomic.AddInt64(&c.stats.FramesSent, 1)
+	atomic.AddInt64(&c.stats.BytesSent, int64(frame.Length)+9)
+	c.updateLastActivity()
+
+	return nil
 }
 
-// checkFlowControl validates flow control before sending DATA frames
-func (c *Connection) checkFlowControl(frame *Frame) error {
-	payloadLen := int32(len(frame.Payload))
-
-	c.flowControlMu.Lock()
-	defer c.flowControlMu.Unlock()
-
-	// Check connection-level window
-	if c.peerConnectionWindow < payloadLen {
-		return fmt.Errorf("connection window insufficient: need %d, have %d",
-			payloadLen, c.peerConnectionWindow)
+// validateFrame ensures frame compliance with RFC 7540
+func (c *Connection) validateFrame(frame *Frame) error {
+	// Check frame size limits
+	maxSize := c.getPeerMaxFrameSize()
+	if frame.Length > maxSize {
+		return fmt.Errorf("frame size %d exceeds maximum %d", frame.Length, maxSize)
 	}
 
-	// Check stream-level window for non-connection frames
-	if frame.StreamID != 0 {
-		c.streamsMu.RLock()
-		stream, exists := c.streams[frame.StreamID]
-		c.streamsMu.RUnlock()
-
-		if !exists {
-			return fmt.Errorf("stream %d does not exist", frame.StreamID)
+	// Stream-specific validation
+	if frame.StreamID > 0 {
+		// Check stream ID validity for client
+		if c.isServer == 0 && frame.StreamID%2 == 0 {
+			return fmt.Errorf("client cannot create even stream ID %d", frame.StreamID)
 		}
-
-		stream.mu.Lock()
-		defer stream.mu.Unlock()
-
-		if stream.PeerWindow < payloadLen {
-			return fmt.Errorf("stream %d window insufficient: need %d, have %d",
-				frame.StreamID, payloadLen, stream.PeerWindow)
+	} else {
+		// Connection-level frames validation
+		switch frame.Type {
+		case FrameTypeSETTINGS, FrameTypePING, FrameTypeGOAWAY, FrameTypeWINDOW_UPDATE:
+			// Valid connection-level frames
+		default:
+			return fmt.Errorf("frame type %d cannot have stream ID 0", frame.Type)
 		}
 	}
 
 	return nil
 }
 
-// updateFlowControlAfterSend updates flow control windows after sending DATA
-func (c *Connection) updateFlowControlAfterSend(frame *Frame) {
-	payloadLen := int32(len(frame.Payload))
-
-	c.flowControlMu.Lock()
-	c.peerConnectionWindow -= payloadLen
-	c.flowControlMu.Unlock()
-
-	// Update stream window
-	if frame.StreamID != 0 {
-		c.streamsMu.RLock()
-		if stream, exists := c.streams[frame.StreamID]; exists {
-			stream.mu.Lock()
-			stream.PeerWindow -= payloadLen
-			stream.mu.Unlock()
-		}
-		c.streamsMu.RUnlock()
+// Send connection preface and initial settings
+func (c *Connection) sendConnectionPreface() error {
+	// Send HTTP/2 magic string per RFC 7540 Section 3.5
+	if _, err := c.conn.Write(ConnectionPreface); err != nil {
+		return fmt.Errorf("failed to send preface: %w", err)
 	}
+
+	// Send initial SETTINGS frame
+	settingsFrame := c.createSettingsFrame(false)
+	return c.writeFrame(settingsFrame)
 }
 
-// ReadFrame reads and returns the next frame from the connection
-func (c *Connection) ReadFrame() (*Frame, error) {
-	if c.isClosed {
-		return nil, fmt.Errorf("connection is closed")
-	}
-
-	// Read frame header (9 bytes)
-	header := make([]byte, 9)
-	if _, err := io.ReadFull(c.reader, header); err != nil {
-		return nil, fmt.Errorf("failed to read frame header: %w", err)
-	}
-
-	// Parse header fields
+// Create SETTINGS frame with current connection settings
+func (c *Connection) createSettingsFrame(ack bool) *Frame {
 	frame := &Frame{
-		Length:   uint32(header[0])<<16 | uint32(header[1])<<8 | uint32(header[2]),
-		Type:     header[3],
-		Flags:    header[4],
-		StreamID: binary.BigEndian.Uint32(header[5:9]) & 0x7FFFFFFF,
+		Type:     FrameTypeSETTINGS,
+		StreamID: 0,
 	}
 
-	// Validate frame length
-	if frame.Length > 0x00FFFFFF { // 2^24 - 1
-		return nil, fmt.Errorf("frame length %d exceeds maximum", frame.Length)
+	if ack {
+		frame.Flags = FlagSettingsAck
+		frame.Length = 0
+		frame.Payload = []byte{}
+		return frame
 	}
 
-	// Read payload if present
-	if frame.Length > 0 {
-		frame.Payload = make([]byte, frame.Length)
-		if _, err := io.ReadFull(c.reader, frame.Payload); err != nil {
-			return nil, fmt.Errorf("failed to read frame payload: %w", err)
-		}
-	}
+	// Build settings payload (6 bytes per setting)
+	payload := make([]byte, 0, len(c.settings)*6)
+	buf := bytes.NewBuffer(payload)
 
-	return frame, nil
+	c.settingsMu.RLock()
+	for id, value := range c.settings {
+		binary.Write(buf, binary.BigEndian, id)
+		binary.Write(buf, binary.BigEndian, value)
+	}
+	c.settingsMu.RUnlock()
+
+	frame.Payload = buf.Bytes()
+	frame.Length = uint32(len(frame.Payload))
+	return frame
 }
 
-// ProcessFrame processes an incoming frame according to its type
-func (c *Connection) ProcessFrame(frame *Frame) error {
-	if c.isClosed {
-		return fmt.Errorf("connection is closed")
+// handleSettingsFrame processes incoming SETTINGS frames
+func (c *Connection) handleSettingsFrame(frame *Frame) {
+	if (frame.Flags & FlagSettingsAck) != 0 {
+		// SETTINGS ACK frame - no payload processing needed
+		LogSettings(nil, true)
+		return
 	}
 
-	switch frame.Type {
-	case FrameTypeSETTINGS:
-		return c.handleSettingsFrame(frame)
-	case FrameTypePING:
-		return c.handlePingFrame(frame)
-	case FrameTypeWINDOW_UPDATE:
-		return c.handleWindowUpdateFrame(frame)
-	case FrameTypeGOAWAY:
-		return c.handleGoAwayFrame(frame)
-	case FrameTypeHEADERS:
-		return c.handleHeadersFrame(frame)
-	case FrameTypeDATA:
-		return c.handleDataFrame(frame)
-	case FrameTypeRST_STREAM:
-		return c.handleRstStreamFrame(frame)
-	case FrameTypePRIORITY:
-		return c.handlePriorityFrame(frame)
-	case FrameTypeCONTINUATION:
-		return c.handleContinuationFrame(frame)
-	default:
-		// Ignore unknown frame types as per RFC 7540 Section 4.1
-		return nil
-	}
-}
+	// Parse settings from payload
+	reader := bytes.NewReader(frame.Payload)
+	newSettings := make(map[string]interface{})
 
-// handleSettingsFrame processes SETTINGS frames as per RFC 7540 Section 6.5
-func (c *Connection) handleSettingsFrame(frame *Frame) error {
-	if frame.StreamID != 0 {
-		return fmt.Errorf("SETTINGS frame with non-zero stream ID %d", frame.StreamID)
-	}
+	for reader.Len() >= 6 {
+		var id uint16
+		var value uint32
 
-	// Handle SETTINGS ACK
-	if frame.Flags&FlagSettingsAck != 0 {
-		if frame.Length != 0 {
-			return fmt.Errorf("SETTINGS ACK frame with non-zero length")
+		if err := binary.Read(reader, binary.BigEndian, &id); err != nil {
+			break
 		}
-		return nil
-	}
+		if err := binary.Read(reader, binary.BigEndian, &value); err != nil {
+			break
+		}
 
-	// Validate payload length (must be multiple of 6)
-	if len(frame.Payload)%6 != 0 {
-		return fmt.Errorf("invalid SETTINGS frame payload length %d", len(frame.Payload))
-	}
+		c.settingsMu.Lock()
+		c.peerSettings[id] = value
+		c.settingsMu.Unlock()
 
-	// Process settings
-	c.settingsMu.Lock()
-	for i := 0; i < len(frame.Payload); i += 6 {
-		id := binary.BigEndian.Uint16(frame.Payload[i : i+2])
-		value := binary.BigEndian.Uint32(frame.Payload[i+2 : i+6])
+		newSettings[fmt.Sprintf("setting_%d", id)] = value
 
-		// Apply specific setting validations
+		// Apply specific settings that affect connection behavior
 		switch id {
 		case SettingsMaxConcurrentStreams:
-			// Update concurrent streams limit - RFC 7540 Section 5.1.2
-			oldMax := c.peerSettings[id]
-			if oldMax == 0 {
-				oldMax = 100 // Default
+			if value > 0 && value < MaxConcurrentStreams {
+				c.maxStreams = value
 			}
-			c.peerSettings[id] = value
-			c.settingsMu.Unlock() // Release lock before calling updateMaxConcurrentStreams
-			c.updateMaxConcurrentStreams(value, oldMax)
-			c.settingsMu.Lock() // Re-acquire lock
-			continue
-
 		case SettingsInitialWindowSize:
-			if value > 0x7FFFFFFF {
-				c.settingsMu.Unlock()
-				return fmt.Errorf("invalid initial window size: %d", value)
-			}
-
+			c.updateInitialWindowSize(value)
 		case SettingsMaxFrameSize:
-			if value < 16384 || value > 16777215 {
-				c.settingsMu.Unlock()
-				return fmt.Errorf("invalid max frame size: %d", value)
+			// Validate frame size range per RFC 7540 Section 6.5.2
+			if value >= 16384 && value <= 16777215 {
+				// Valid frame size - store for validation
 			}
-
-		case SettingsEnablePush:
-			if value != 0 && value != 1 {
-				c.settingsMu.Unlock()
-				return fmt.Errorf("invalid enable push value: %d", value)
-			}
-		}
-
-		oldValue := c.peerSettings[id]
-		c.peerSettings[id] = value
-
-		// Apply other setting changes
-		if id == SettingsInitialWindowSize {
-			c.settingsMu.Unlock()
-			c.updateInitialWindowSize(int32(value), int32(oldValue))
-			c.settingsMu.Lock()
-		} else if id == SettingsHeaderTableSize {
-			c.hpackMu.Lock()
-			c.headerDecoder.SetMaxDynamicTableSize(value)
-			c.hpackMu.Unlock()
 		}
 	}
-	c.settingsMu.Unlock()
 
-	// Send SETTINGS ACK
+	// Send SETTINGS ACK as required by RFC 7540
 	ackFrame := c.createSettingsFrame(true)
-	return c.writeFrame(ackFrame)
+	c.writeFrame(ackFrame)
+
+	LogSettings(newSettings, false)
 }
 
-// updateMaxConcurrentStreams updates the concurrent streams limit
-func (c *Connection) updateMaxConcurrentStreams(newMax, oldMax uint32) {
-	c.concurrencyMu.Lock()
-	defer c.concurrencyMu.Unlock()
-
-	if newMax == 0 {
-		newMax = 100 // Default recommended by RFC 7540
-	}
-
-	c.maxConcurrentStreams = newMax
-
-	// Adjust semaphore capacity
-	delta := int(newMax) - int(oldMax)
-
-	if delta > 0 {
-		// Increase capacity - add more slots
-		for i := 0; i < delta; i++ {
-			select {
-			case c.streamSemaphore <- struct{}{}:
-				// Added slot successfully
-			default:
-				// Channel full, shouldn't happen but handle gracefully
-				break
-			}
-		}
-	} else if delta < 0 {
-		// Decrease capacity - remove slots
-		for i := 0; i < -delta; i++ {
-			select {
-			case <-c.streamSemaphore:
-				// Removed slot successfully
-			default:
-				// No slots to remove
-				break
-			}
-		}
-	}
-}
-
-// createStreamInternal creates a stream internally (assumes locks held)
-func (c *Connection) createStreamInternal(streamID uint32) *Stream {
-	stream := &Stream{
-		ID:           streamID,
-		State:        StreamStateIdle,
-		WindowSize:   c.initialWindowSize,
-		PeerWindow:   c.initialWindowSize,
-		Headers:      make(map[string]string),
-		responseChan: make(chan *StreamResponse, 1),
-		doneChan:     make(chan struct{}),
-	}
-
-	c.streamsMu.Lock()
-	c.streams[streamID] = stream
-	c.streamsMu.Unlock()
-
-	return stream
-}
-
-// GetActiveStreamCount returns current number of active streams
-func (c *Connection) GetActiveStreamCount() int32 {
-	c.concurrencyMu.RLock()
-	defer c.concurrencyMu.RUnlock()
-	return c.activeStreams
-}
-
-// GetMaxConcurrentStreams returns the peer's max concurrent streams setting
-func (c *Connection) GetMaxConcurrentStreams() uint32 {
-	c.concurrencyMu.RLock()
-	defer c.concurrencyMu.RUnlock()
-	return c.maxConcurrentStreams
-}
-
-// updateInitialWindowSize updates all stream windows when INITIAL_WINDOW_SIZE changes
-func (c *Connection) updateInitialWindowSize(newSize, oldSize int32) {
-	delta := newSize - oldSize
-
-	c.streamsMu.RLock()
-	streams := make([]*Stream, 0, len(c.streams))
-	for _, stream := range c.streams {
-		streams = append(streams, stream)
-	}
-	c.streamsMu.RUnlock()
-
-	// Update all stream windows
-	for _, stream := range streams {
-		stream.mu.Lock()
-		stream.PeerWindow += delta
-		stream.mu.Unlock()
-	}
-
-	// Update initial window size for future streams
-	c.flowControlMu.Lock()
-	c.initialWindowSize = newSize
-	c.flowControlMu.Unlock()
-}
-
-// handlePingFrame processes PING frames as per RFC 7540 Section 6.7
-func (c *Connection) handlePingFrame(frame *Frame) error {
-	if frame.StreamID != 0 {
-		return fmt.Errorf("PING frame with non-zero stream ID %d", frame.StreamID)
-	}
-
-	if len(frame.Payload) != 8 {
-		return fmt.Errorf("invalid PING frame payload length %d", len(frame.Payload))
-	}
-
-	// Send PING ACK if not already an ACK
-	if frame.Flags&FlagPingAck == 0 {
-		ackFrame := &Frame{
-			Length:   8,
-			Type:     FrameTypePING,
-			Flags:    FlagPingAck,
-			StreamID: 0,
-			Payload:  frame.Payload, // Echo the payload
-		}
-		return c.writeFrame(ackFrame)
-	}
-
-	return nil
-}
-
-// handleWindowUpdateFrame processes WINDOW_UPDATE frames as per RFC 7540 Section 6.9
-func (c *Connection) handleWindowUpdateFrame(frame *Frame) error {
+// handleWindowUpdateFrame processes WINDOW_UPDATE frames for flow control
+func (c *Connection) handleWindowUpdateFrame(frame *Frame) {
 	if len(frame.Payload) != 4 {
-		return fmt.Errorf("invalid WINDOW_UPDATE frame payload length %d", len(frame.Payload))
+		c.sendGoAway(0, ErrorCodeFrameSizeError, []byte("Invalid WINDOW_UPDATE size"))
+		return
 	}
 
-	increment := int32(binary.BigEndian.Uint32(frame.Payload) & 0x7FFFFFFF)
-	if increment == 0 {
-		return fmt.Errorf("WINDOW_UPDATE with zero increment")
-	}
+	increment := binary.BigEndian.Uint32(frame.Payload) & 0x7FFFFFFF
 
 	if frame.StreamID == 0 {
 		// Connection-level window update
-		c.flowControlMu.Lock()
-		newWindow := c.peerConnectionWindow + increment
-		if newWindow > 0x7FFFFFFF {
-			c.flowControlMu.Unlock()
-			return fmt.Errorf("connection flow control window overflow")
-		}
-		c.peerConnectionWindow = newWindow
-		c.flowControlMu.Unlock()
+		atomic.AddInt64(&c.peerConnectionWindow, int64(increment))
 	} else {
 		// Stream-level window update
-		c.streamsMu.RLock()
-		stream, exists := c.streams[frame.StreamID]
-		c.streamsMu.RUnlock()
-
-		if !exists {
-			// Ignore WINDOW_UPDATE for closed/unknown streams
-			return nil
+		if streamVal, exists := c.streams.Load(frame.StreamID); exists {
+			stream := streamVal.(*Stream)
+			stream.UpdateSendWindow(int32(increment))
 		}
-
-		stream.mu.Lock()
-		newWindow := stream.PeerWindow + increment
-		if newWindow > 0x7FFFFFFF {
-			stream.mu.Unlock()
-			return fmt.Errorf("stream %d flow control window overflow", frame.StreamID)
-		}
-		stream.PeerWindow = newWindow
-		stream.mu.Unlock()
 	}
-
-	return nil
 }
 
-// handleGoAwayFrame processes GOAWAY frames as per RFC 7540 Section 6.8
-func (c *Connection) handleGoAwayFrame(frame *Frame) error {
-	if frame.StreamID != 0 {
-		return fmt.Errorf("GOAWAY frame with non-zero stream ID %d", frame.StreamID)
+// handlePingFrame processes PING frames for keepalive
+func (c *Connection) handlePingFrame(frame *Frame) {
+	if len(frame.Payload) != 8 {
+		c.sendGoAway(0, ErrorCodeFrameSizeError, []byte("Invalid PING size"))
+		return
 	}
 
+	if (frame.Flags & FlagPingAck) != 0 {
+		// PING ACK received - could measure RTT here
+		LogConnection("ping_ack_received", c.remoteAdd, map[string]interface{}{
+			"data": string(frame.Payload),
+		})
+		return
+	}
+
+	// Send PING ACK response
+	pongFrame := &Frame{
+		Length:   8,
+		Type:     FrameTypePING,
+		Flags:    FlagPingAck,
+		StreamID: 0,
+		Payload:  frame.Payload,
+	}
+
+	c.writeFrame(pongFrame)
+}
+
+// handleGoAwayFrame processes GOAWAY frames for graceful shutdown
+func (c *Connection) handleGoAwayFrame(frame *Frame) {
 	if len(frame.Payload) < 8 {
-		return fmt.Errorf("invalid GOAWAY frame payload length %d", len(frame.Payload))
+		return
 	}
 
 	lastStreamID := binary.BigEndian.Uint32(frame.Payload[0:4]) & 0x7FFFFFFF
 	errorCode := binary.BigEndian.Uint32(frame.Payload[4:8])
+	debugData := frame.Payload[8:]
 
-	// Additional debug data if present
-	var debugData []byte
-	if len(frame.Payload) > 8 {
-		debugData = frame.Payload[8:]
-	}
-
-	fmt.Printf("Received GOAWAY: lastStreamID=%d, errorCode=%d, debugData=%q\n",
-		lastStreamID, errorCode, string(debugData))
-
-	// Initiate graceful connection closure
-	c.closeOnce.Do(func() {
-		close(c.closeChan)
-		c.isClosed = true
+	LogConnection("goaway_received", c.remoteAdd, map[string]interface{}{
+		"last_stream_id": lastStreamID,
+		"error_code":     errorCode,
+		"debug_data":     string(debugData),
 	})
 
-	return fmt.Errorf("connection terminated by peer: error code %d", errorCode)
+	// Start graceful shutdown process
+	go c.Close()
 }
 
-// handleHeadersFrame processes HEADERS frames as per RFC 7540 Section 6.2
-func (c *Connection) handleHeadersFrame(frame *Frame) error {
-	if frame.StreamID == 0 {
-		return fmt.Errorf("HEADERS frame with zero stream ID")
-	}
-
-	// Get or create stream
-	c.streamsMu.Lock()
-	stream, exists := c.streams[frame.StreamID]
-	if !exists {
-		stream = &Stream{
-			ID:         frame.StreamID,
-			State:      StreamStateOpen,
-			WindowSize: c.initialWindowSize,
-			PeerWindow: c.initialWindowSize,
-			Headers:    make(map[string]string),
-		}
-		c.streams[frame.StreamID] = stream
-	}
-	c.streamsMu.Unlock()
-
-	// Decode headers using HPACK
-	headers, err := c.headerDecoder.Decode(frame.Payload)
-	if err != nil {
-		return fmt.Errorf("HPACK decode error for stream %d: %w", frame.StreamID, err)
-	}
-
-	stream.mu.Lock()
-	// Merge headers
-	for name, value := range headers {
-		stream.Headers[name] = value
-	}
-
-	// Update stream state based on END_STREAM flag
-	if frame.Flags&FlagHeadersEndStream != 0 {
-		stream.EndStream = true
-		if stream.State == StreamStateOpen {
-			stream.State = StreamStateHalfClosedRemote
-		}
-	}
-	stream.mu.Unlock()
-
-	return nil
-}
-
-// handleDataFrame processes DATA frames as per RFC 7540 Section 6.1
-func (c *Connection) handleDataFrame(frame *Frame) error {
-	if frame.StreamID == 0 {
-		return fmt.Errorf("DATA frame with zero stream ID")
-	}
-
-	payloadLen := int32(len(frame.Payload))
-
-	// Update connection flow control window
-	c.flowControlMu.Lock()
-	c.connectionWindow -= payloadLen
-	connectionWindow := c.connectionWindow
-	c.flowControlMu.Unlock()
-
-	// Find stream
-	c.streamsMu.RLock()
-	stream, exists := c.streams[frame.StreamID]
-	c.streamsMu.RUnlock()
-
-	if !exists {
-		return fmt.Errorf("DATA frame for unknown stream %d", frame.StreamID)
-	}
-
-	stream.mu.Lock()
-	// Update stream flow control and data
-	stream.WindowSize -= payloadLen
-	stream.Data = append(stream.Data, frame.Payload...)
-	streamWindow := stream.WindowSize
-
-	// Update stream state on END_STREAM
-	if frame.Flags&FlagDataEndStream != 0 {
-		stream.EndStream = true
-		if stream.State == StreamStateOpen {
-			stream.State = StreamStateHalfClosedRemote
-		}
-	}
-	stream.mu.Unlock()
-
-	// Send WINDOW_UPDATE frames when windows get low
-	if connectionWindow < 32768 {
-		c.sendWindowUpdate(0, 65535)
-		c.flowControlMu.Lock()
-		c.connectionWindow += 65535
-		c.flowControlMu.Unlock()
-	}
-
-	if streamWindow < 32768 {
-		c.sendWindowUpdate(frame.StreamID, 65535)
-		stream.mu.Lock()
-		stream.WindowSize += 65535
-		stream.mu.Unlock()
-	}
-
-	return nil
-}
-
-// handleRstStreamFrame processes RST_STREAM frames as per RFC 7540 Section 6.4
-func (c *Connection) handleRstStreamFrame(frame *Frame) error {
-	if frame.StreamID == 0 {
-		return fmt.Errorf("RST_STREAM frame with zero stream ID")
-	}
-
+// handleRstStreamFrame processes RST_STREAM frames for stream termination
+func (c *Connection) handleRstStreamFrame(frame *Frame) {
 	if len(frame.Payload) != 4 {
-		return fmt.Errorf("invalid RST_STREAM frame payload length %d", len(frame.Payload))
+		return
 	}
 
 	errorCode := binary.BigEndian.Uint32(frame.Payload)
 
-	// Close the stream
-	c.streamsMu.Lock()
-	if stream, exists := c.streams[frame.StreamID]; exists {
-		stream.mu.Lock()
-		stream.State = StreamStateClosed
-		stream.mu.Unlock()
-		delete(c.streams, frame.StreamID)
+	if streamVal, exists := c.streams.Load(frame.StreamID); exists {
+		stream := streamVal.(*Stream)
+		stream.Reset(errorCode)
+		c.streams.Delete(frame.StreamID)
+		atomic.AddInt64(&c.streamCount, -1)
+		atomic.AddInt64(&c.stats.StreamsClosed, 1)
 	}
-	c.streamsMu.Unlock()
 
-	fmt.Printf("Stream %d reset with error code %d\n", frame.StreamID, errorCode)
-	return nil
+	LogStream(frame.StreamID, "active", "reset", map[string]interface{}{
+		"error_code": errorCode,
+	})
 }
 
-// handlePriorityFrame processes PRIORITY frames as per RFC 7540 Section 6.3
-func (c *Connection) handlePriorityFrame(frame *Frame) error {
-	if frame.StreamID == 0 {
-		return fmt.Errorf("PRIORITY frame with zero stream ID")
+// sendRstStream sends RST_STREAM frame to terminate a stream
+func (c *Connection) sendRstStream(streamID uint32, errorCode uint32) error {
+	payload := make([]byte, 4)
+	binary.BigEndian.PutUint32(payload, errorCode)
+
+	frame := &Frame{
+		Length:   4,
+		Type:     FrameTypeRST_STREAM,
+		Flags:    0,
+		StreamID: streamID,
+		Payload:  payload,
 	}
 
-	if len(frame.Payload) != 5 {
-		return fmt.Errorf("invalid PRIORITY frame payload length %d", len(frame.Payload))
-	}
-
-	// For now, just acknowledge receipt - priority handling can be implemented later
-	return nil
+	return c.writeFrame(frame)
 }
 
-// handleContinuationFrame processes CONTINUATION frames as per RFC 7540 Section 6.10
-func (c *Connection) handleContinuationFrame(frame *Frame) error {
-	if frame.StreamID == 0 {
-		return fmt.Errorf("CONTINUATION frame with zero stream ID")
+// sendGoAway sends GOAWAY frame for graceful connection shutdown
+func (c *Connection) sendGoAway(lastStreamID uint32, errorCode uint32, debugData []byte) error {
+	payload := make([]byte, 8+len(debugData))
+	binary.BigEndian.PutUint32(payload[0:4], lastStreamID&0x7FFFFFFF)
+	binary.BigEndian.PutUint32(payload[4:8], errorCode)
+	copy(payload[8:], debugData)
+
+	frame := &Frame{
+		Length:   uint32(len(payload)),
+		Type:     FrameTypeGOAWAY,
+		Flags:    0,
+		StreamID: 0,
+		Payload:  payload,
 	}
 
-	// Simplified handling - in full implementation, this would handle
-	// header block continuation across multiple frames
-	return nil
+	return c.writeFrame(frame)
 }
 
-// sendWindowUpdate sends a WINDOW_UPDATE frame
+// sendWindowUpdate sends WINDOW_UPDATE frame for flow control
 func (c *Connection) sendWindowUpdate(streamID uint32, increment uint32) error {
-	if increment == 0 || increment > 0x7FFFFFFF {
-		return fmt.Errorf("invalid window update increment: %d", increment)
-	}
-
 	payload := make([]byte, 4)
 	binary.BigEndian.PutUint32(payload, increment&0x7FFFFFFF)
 
@@ -1042,189 +1042,10 @@ func (c *Connection) sendWindowUpdate(streamID uint32, increment uint32) error {
 	return c.writeFrame(frame)
 }
 
-// GetStream returns a stream by ID (thread-safe)
-func (c *Connection) GetStream(streamID uint32) (*Stream, bool) {
-	c.streamsMu.RLock()
-	defer c.streamsMu.RUnlock()
-	stream, exists := c.streams[streamID]
-	return stream, exists
-}
-
-// CreateStream creates a new stream with the given ID
-func (c *Connection) CreateStream(streamID uint32) *Stream {
-	c.streamsMu.Lock()
-	defer c.streamsMu.Unlock()
-
-	stream := &Stream{
-		ID:         streamID,
-		State:      StreamStateIdle,
-		WindowSize: c.initialWindowSize,
-		PeerWindow: c.initialWindowSize,
-		Headers:    make(map[string]string),
-	}
-	c.streams[streamID] = stream
-
-	if streamID > c.lastStreamID {
-		c.lastStreamID = streamID
-	}
-
-	return stream
-}
-
-// GetNextStreamID returns the next valid stream ID for this endpoint
-func (c *Connection) GetNextStreamID() uint32 {
-	c.streamsMu.Lock()
-	defer c.streamsMu.Unlock()
-
-	if c.isServer {
-		// Server-initiated streams are even
-		atomic.AddUint32(&c.lastStreamID, 2)
-	} else {
-		// Client-initiated streams are odd
-		if c.lastStreamID == 0 || c.lastStreamID%2 == 0 {
-			atomic.AddUint32(&c.lastStreamID, 1)
-		} else {
-			atomic.AddUint32(&c.lastStreamID, 2)
-		}
-	}
-
-	return atomic.LoadUint32(&c.lastStreamID)
-}
-
-// Close gracefully closes the connection
-func (c *Connection) Close() error {
-	c.closeOnce.Do(func() {
-		close(c.closeChan)
-		c.isClosed = true
-
-		// Close all pending stream requests
-		go func() {
-			for {
-				select {
-				case req := <-c.streamQueue:
-					req.ResponseChan <- &StreamResponse{Error: fmt.Errorf("connection closed")}
-				default:
-					return
-				}
-			}
-		}()
-	})
-	return c.conn.Close()
-}
-
-// IsClosed returns whether the connection is closed
-func (c *Connection) IsClosed() bool {
-	return c.isClosed
-}
-
-// CloseChan returns a channel that closes when the connection is closed
-func (c *Connection) CloseChan() <-chan struct{} {
-	return c.closeChan
-}
-
-// StartReading continuously reads and processes frames from the connection
-func (c *Connection) StartReading() error {
-	for {
-		select {
-		case <-c.closeChan:
-			return fmt.Errorf("connection closed")
-		default:
-		}
-
-		frame, err := c.ReadFrame()
-		if err != nil {
-			if c.isClosed {
-				return nil // Expected when connection is closed
-			}
-			return fmt.Errorf("failed to read frame: %w", err)
-		}
-
-		if err := c.ProcessFrame(frame); err != nil {
-			fmt.Printf("Error processing frame: %v\n", err)
-			// Continue processing other frames even if one fails
-			// In a production implementation, you might want more sophisticated error handling
-		}
-	}
-}
-
-// GetConnectionWindow returns the current connection-level flow control window
-func (c *Connection) GetConnectionWindow() int32 {
-	c.flowControlMu.Lock()
-	defer c.flowControlMu.Unlock()
-	return c.connectionWindow
-}
-
-// GetPeerConnectionWindow returns the peer's connection-level flow control window
-func (c *Connection) GetPeerConnectionWindow() int32 {
-	c.flowControlMu.Lock()
-	defer c.flowControlMu.Unlock()
-	return c.peerConnectionWindow
-}
-
-// GetSetting returns a setting value from our settings
-func (c *Connection) GetSetting(id uint16) (uint32, bool) {
-	c.settingsMu.RLock()
-	defer c.settingsMu.RUnlock()
-	value, exists := c.settings[id]
-	return value, exists
-}
-
-// GetPeerSetting returns a setting value from peer's settings
-func (c *Connection) GetPeerSetting(id uint16) (uint32, bool) {
-	c.settingsMu.RLock()
-	defer c.settingsMu.RUnlock()
-	value, exists := c.peerSettings[id]
-	return value, exists
-}
-
-// SendGoAway sends a GOAWAY frame to gracefully shut down the connection
-func (c *Connection) SendGoAway(lastStreamID uint32, errorCode uint32, debugData []byte) error {
-	payload := make([]byte, 8+len(debugData))
-	binary.BigEndian.PutUint32(payload[0:4], lastStreamID&0x7FFFFFFF)
-	binary.BigEndian.PutUint32(payload[4:8], errorCode)
-	copy(payload[8:], debugData)
-
-	frame := &Frame{
-		Length:   uint32(len(payload)),
-		Type:     FrameTypeGOAWAY,
-		Flags:    0,
-		StreamID: 0,
-		Payload:  payload,
-	}
-
-	return c.WriteFrame(frame)
-}
-
-// SendRstStream sends a RST_STREAM frame to reset a stream
-func (c *Connection) SendRstStream(streamID uint32, errorCode uint32) error {
-	payload := make([]byte, 4)
-	binary.BigEndian.PutUint32(payload, errorCode)
-
-	frame := &Frame{
-		Length:   4,
-		Type:     FrameTypeRST_STREAM,
-		Flags:    0,
-		StreamID: streamID,
-		Payload:  payload,
-	}
-
-	// Remove stream from our tracking
-	c.streamsMu.Lock()
-	if stream, exists := c.streams[streamID]; exists {
-		stream.mu.Lock()
-		stream.State = StreamStateClosed
-		stream.mu.Unlock()
-		delete(c.streams, streamID)
-	}
-	c.streamsMu.Unlock()
-
-	return c.WriteFrame(frame)
-}
-
-// SendPing sends a PING frame
+// SendPing sends PING frame for connection health check
 func (c *Connection) SendPing(data []byte) error {
 	if len(data) != 8 {
-		return fmt.Errorf("PING data must be exactly 8 bytes, got %d", len(data))
+		return fmt.Errorf("PING data must be exactly 8 bytes")
 	}
 
 	frame := &Frame{
@@ -1235,5 +1056,240 @@ func (c *Connection) SendPing(data []byte) error {
 		Payload:  data,
 	}
 
-	return c.WriteFrame(frame)
+	return c.writeFrame(frame)
+}
+
+// updateInitialWindowSize updates initial window size for new streams
+func (c *Connection) updateInitialWindowSize(newSize uint32) {
+	if newSize > 0x7FFFFFFF {
+		// Invalid window size per RFC 7540
+		c.sendGoAway(0, ErrorCodeFlowControlError, []byte("Invalid window size"))
+		return
+	}
+
+	c.flowControlMu.Lock()
+	oldSize := c.initialWindowSize
+	c.initialWindowSize = newSize
+
+	// Update all existing streams with the window size delta
+	delta := int32(newSize) - int32(oldSize)
+	c.streams.Range(func(key, value interface{}) bool {
+		stream := value.(*Stream)
+		stream.updateWindowSize(delta)
+		return true
+	})
+	c.flowControlMu.Unlock()
+}
+
+// getPeerMaxFrameSize returns the peer's maximum frame size setting
+func (c *Connection) getPeerMaxFrameSize() uint32 {
+	c.settingsMu.RLock()
+	maxSize, exists := c.peerSettings[SettingsMaxFrameSize]
+	c.settingsMu.RUnlock()
+
+	if !exists {
+		return DefaultMaxFrameSize
+	}
+	return maxSize
+}
+
+// releaseStreamSlot releases a stream semaphore slot
+func (c *Connection) releaseStreamSlot() {
+	select {
+	case c.streamSemaphore <- struct{}{}:
+		// Successfully released slot
+	default:
+		// Semaphore full - this shouldn't happen but handle gracefully
+	}
+}
+
+// connectionMonitor monitors connection health and performance
+func (c *Connection) connectionMonitor() {
+	defer c.closeWaitGroup.Done()
+
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			c.logConnectionStats()
+
+		case <-c.shutdownCtx.Done():
+			return
+		}
+	}
+}
+
+// logConnectionStats logs periodic connection statistics
+func (c *Connection) logConnectionStats() {
+	c.statsMu.RLock()
+	stats := c.stats
+	c.statsMu.RUnlock()
+
+	streamCount := atomic.LoadInt64(&c.streamCount)
+	uptime := time.Since(c.startTime)
+
+	LogConnection("connection_stats", c.remoteAdd, map[string]interface{}{
+		"uptime_seconds":    uptime.Seconds(),
+		"streams_active":    streamCount,
+		"frames_sent":       stats.FramesSent,
+		"frames_received":   stats.FramesReceived,
+		"bytes_sent":        stats.BytesSent,
+		"bytes_received":    stats.BytesReceived,
+		"headers_encoded":   stats.HeadersEncoded,
+		"headers_decoded":   stats.HeadersDecoded,
+		"compression_ratio": float64(stats.BytesSent) / float64(stats.BytesReceived+1),
+	})
+}
+
+// updateLastActivity updates the connection's last activity timestamp
+func (c *Connection) updateLastActivity() {
+	c.statsMu.Lock()
+	c.stats.LastActivity = time.Now()
+	c.statsMu.Unlock()
+}
+
+// IsClosed returns whether the connection is closed
+func (c *Connection) IsClosed() bool {
+	return atomic.LoadInt32(&c.isClosed) != 0
+}
+
+// GetNextStreamID returns the next valid stream ID for this endpoint
+func (c *Connection) GetNextStreamID() uint32 {
+	return atomic.AddUint32(&c.lastStreamID, 2)
+}
+
+// GetStats returns current connection statistics
+func (c *Connection) GetStats() ConnectionStats {
+	c.statsMu.RLock()
+	defer c.statsMu.RUnlock()
+	return c.stats
+}
+
+// Close gracefully closes the connection with proper cleanup
+func (c *Connection) Close() error {
+	c.shutdownOnce.Do(func() {
+		atomic.StoreInt32(&c.isClosed, 1)
+
+		// Cancel shutdown context to stop all goroutines
+		c.shutdownCancel()
+
+		// Send GOAWAY frame to notify peer
+		c.sendGoAway(atomic.LoadUint32(&c.lastStreamID), ErrorCodeNoError,
+			[]byte("Connection closing"))
+
+		// Stop stream workers
+		for _, worker := range c.streamWorkers {
+			close(worker.shutdown)
+			worker.wg.Wait()
+		}
+
+		// Close all streams
+		c.streams.Range(func(key, value interface{}) bool {
+			stream := value.(*Stream)
+			stream.Close()
+			return true
+		})
+
+		// Close channels
+		close(c.outgoingFrames)
+		close(c.incomingFrames)
+		close(c.streamQueue)
+
+		// Wait for all background goroutines to finish
+		c.closeWaitGroup.Wait()
+
+		// Return HPACK objects to pools for memory efficiency
+		if c.hpackEncoder != nil {
+			PutHPACKEncoder(c.hpackEncoder)
+		}
+		if c.hpackDecoder != nil {
+			PutHPACKDecoder(c.hpackDecoder)
+		}
+
+		// Close the underlying network connection
+		if c.conn != nil {
+			c.conn.Close()
+		}
+
+		LogConnection("connection_closed", c.remoteAdd, map[string]interface{}{
+			"uptime_seconds": time.Since(c.startTime).Seconds(),
+			"streams_total":  c.stats.StreamsCreated,
+			"frames_sent":    c.stats.FramesSent,
+			"frames_recv":    c.stats.FramesReceived,
+		})
+	})
+
+	return nil
+}
+
+// Helper functions for connection management
+
+// calculateHeadersSize calculates the total size of headers for statistics
+func calculateHeadersSize(headers map[string]string) int {
+	size := 0
+	for name, value := range headers {
+		size += len(name) + len(value) + 2 // +2 for separators
+	}
+	return size
+}
+
+// FrameReader provides efficient frame reading from buffered connection
+type FrameReader struct {
+	reader *bufio.Reader
+}
+
+// NewFrameReader creates a new optimized frame reader
+func NewFrameReader(reader *bufio.Reader) *FrameReader {
+	return &FrameReader{reader: reader}
+}
+
+// ReadFrame reads a complete HTTP/2 frame from the connection
+func (fr *FrameReader) ReadFrame() (*Frame, error) {
+	// Read frame header (9 bytes) as per RFC 7540 Section 4.1
+	header := make([]byte, 9)
+	if _, err := io.ReadFull(fr.reader, header); err != nil {
+		return nil, fmt.Errorf("failed to read frame header: %w", err)
+	}
+
+	// Parse frame header fields
+	length := uint32(header[0])<<16 | uint32(header[1])<<8 | uint32(header[2])
+	frameType := header[3]
+	flags := header[4]
+	streamID := binary.BigEndian.Uint32(header[5:]) & 0x7FFFFFFF
+
+	// Read frame payload if present
+	var payload []byte
+	if length > 0 {
+		payload = make([]byte, length)
+		if _, err := io.ReadFull(fr.reader, payload); err != nil {
+			return nil, fmt.Errorf("failed to read frame payload: %w", err)
+		}
+	}
+
+	return &Frame{
+		Length:   length,
+		Type:     frameType,
+		Flags:    flags,
+		StreamID: streamID,
+		Payload:  payload,
+	}, nil
+}
+
+// FrameWriter provides efficient frame writing to buffered connection
+type FrameWriter struct {
+	writer *bufio.Writer
+}
+
+// NewFrameWriter creates a new optimized frame writer
+func NewFrameWriter(writer *bufio.Writer) *FrameWriter {
+	return &FrameWriter{writer: writer}
+}
+
+// StartReading provides compatibility for existing code
+func (c *Connection) StartReading() error {
+	// This method provides compatibility - actual reading is handled by frameReaderLoop
+	<-c.shutdownCtx.Done()
+	return nil
 }

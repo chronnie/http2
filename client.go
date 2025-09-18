@@ -3,34 +3,26 @@ package http2
 import (
 	"context"
 	"fmt"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
-// Timeouts and intervals
+// Client configuration constants
 const (
-	DefaultRequestTimeout   = 30 * time.Second
-	ResponsePollingInterval = 10 * time.Millisecond
-	ConnectionSetupDelay    = 100 * time.Millisecond
+	DefaultRequestTimeout  = 30 * time.Second
+	ConnectionSetupTimeout = 10 * time.Second
+	MaxRetryAttempts       = 3
+	RetryBackoffDuration   = 100 * time.Millisecond
+	ClientUserAgent        = "http2-client/1.0"
 )
 
-// Flow control constants
+// Flow control and performance constants
 const (
-	FlowControlWindowThreshold = 32768 // Send WINDOW_UPDATE when window drops below this
-	DefaultConnectionWindow    = 65535 // Default connection-level window size
-)
-
-// Default frame size constant
-const (
-	DefaultMaxFrameSize = 16384 // Default maximum frame size per RFC 7540
-)
-
-// PING frame constants
-const (
-	PingFrameSize   = 8
-	DefaultPingData = "http2lib"
+	DefaultClientWindow        = 1048576 // 1MB window for better performance
+	ClientMaxFrameSize         = 1048576 // 1MB max frame size
+	ClientMaxHeaderListSize    = 16384   // 16KB max header list
+	ClientMaxConcurrentStreams = 1000    // High concurrency limit
 )
 
 // HTTP/2 pseudo-headers as per RFC 7540 Section 8.1.2.3
@@ -42,7 +34,7 @@ const (
 	PseudoHeaderStatus    = ":status"
 )
 
-// HTTP methods
+// Standard HTTP methods
 const (
 	MethodGET     = "GET"
 	MethodPOST    = "POST"
@@ -60,754 +52,544 @@ const (
 	SchemeHTTPS = "https"
 )
 
-// Standard HTTP headers
+// Common HTTP headers
 const (
-	HeaderContentType   = "content-type"
-	HeaderContentLength = "content-length"
-	HeaderAccept        = "accept"
-	HeaderUserAgent     = "user-agent"
-	HeaderAuthorization = "authorization"
+	HeaderContentType    = "content-type"
+	HeaderContentLength  = "content-length"
+	HeaderAccept         = "accept"
+	HeaderUserAgent      = "user-agent"
+	HeaderAuthorization  = "authorization"
+	HeaderAcceptEncoding = "accept-encoding"
+	HeaderCacheControl   = "cache-control"
+	HeaderConnection     = "connection"
+	HeaderHost           = "host"
 )
 
-// ClientStreamRequest represents a queued stream request to maintain proper ordering
-type ClientStreamRequest struct {
-	req          *Request
-	streamID     uint32
-	responseChan chan *ClientStreamResult
-	ctx          context.Context
-}
-
-// ClientStreamResult contains the result of a stream request
-type ClientStreamResult struct {
-	response *Response
-	err      error
-}
-
-// Client provides high-level HTTP/2 client functionality with proper concurrent stream management
+// Client represents an optimized HTTP/2 client with advanced features
 type Client struct {
-	conn *Connection
+	// Core connection management
+	conn    *Connection
+	address string
+	scheme  string
 
-	// *** CONCURRENT STREAM MANAGEMENT ***
-	// RFC 7540 Section 5.1.2 - Proper concurrent streams with HPACK ordering
+	// Client configuration
+	timeout        time.Duration
+	userAgent      string
+	defaultHeaders map[string]string
 
-	// Stream creation serialization to prevent HPACK corruption
-	// This ensures HEADERS frames are sent in proper sequence
-	streamCreationMu sync.Mutex
+	// Performance tracking
+	activeRequests int64
+	totalRequests  int64
+	totalErrors    int64
+	startTime      time.Time
 
-	// Request queue for batching and ordering
-	requestQueue chan *ClientStreamRequest
+	// Connection pool for future extension
+	connPool   sync.Pool
+	connPoolMu sync.RWMutex
 
-	// Active stream tracking for concurrency limits
-	activeStreams        int64 // Atomic counter for active streams
-	maxConcurrentStreams uint32
+	// Request processing
+	requestQueue     chan *ClientRequest
+	responseChannels sync.Map // map[uint32]chan *ClientResponse
 
-	// Stream completion tracking
-	streamWaitGroup sync.WaitGroup
-
-	// Background workers
-	requestProcessor *sync.WaitGroup
-	shutdownChan     chan struct{}
-	shutdownOnce     sync.Once
+	// Lifecycle management
+	ctx       context.Context
+	cancel    context.CancelFunc
+	closed    int32
+	closeOnce sync.Once
+	wg        sync.WaitGroup
 }
 
-// NewClient creates a new HTTP/2 client with proper concurrent stream management
+// ClientRequest represents an internal HTTP/2 client request
+type ClientRequest struct {
+	Method   string
+	URL      string
+	Headers  map[string]string
+	Body     []byte
+	Timeout  time.Duration
+	Context  context.Context
+	Response chan *ClientResponse
+}
+
+// ClientResponse represents an HTTP/2 client response
+type ClientResponse struct {
+	StatusCode int
+	Status     string
+	Headers    map[string]string
+	Body       []byte
+	Error      error
+	StreamID   uint32
+	Duration   time.Duration
+}
+
+// NewClient creates a new optimized HTTP/2 client
 func NewClient(address string) (*Client, error) {
-	conn, err := NewConnection(address)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create HTTP/2 connection: %w", err)
+	// Parse address and determine scheme
+	scheme := SchemeHTTP
+	if len(address) > 8 && address[:8] == "https://" {
+		scheme = SchemeHTTPS
+		address = address[8:]
+	} else if len(address) > 7 && address[:7] == "http://" {
+		address = address[7:]
 	}
+
+	// Create client context for lifecycle management
+	ctx, cancel := context.WithCancel(context.Background())
 
 	client := &Client{
-		conn:                 conn,
-		requestQueue:         make(chan *ClientStreamRequest, 1000), // Large buffer for high throughput
-		maxConcurrentStreams: 100,                                   // Default limit, will be updated by peer settings
-		requestProcessor:     &sync.WaitGroup{},
-		shutdownChan:         make(chan struct{}),
+		address:        address,
+		scheme:         scheme,
+		timeout:        DefaultRequestTimeout,
+		userAgent:      ClientUserAgent,
+		defaultHeaders: make(map[string]string),
+		startTime:      time.Now(),
+		requestQueue:   make(chan *ClientRequest, 1000),
+		ctx:            ctx,
+		cancel:         cancel,
 	}
 
-	// Start background frame processing
-	go func() {
-		if err := conn.StartReading(); err != nil && !conn.IsClosed() {
-			fmt.Printf("Connection reading error: %v\n", err)
-		}
-	}()
+	// Set default headers
+	client.defaultHeaders[HeaderUserAgent] = client.userAgent
+	client.defaultHeaders[HeaderAcceptEncoding] = "gzip, deflate"
 
-	numWorkers := 3 // Optimal number for most use cases
-	for i := 0; i < numWorkers; i++ {
-		client.requestProcessor.Add(1)
-		go client.requestWorker(i)
+	// Initialize connection pool
+	client.connPool = sync.Pool{
+		New: func() interface{} {
+			conn, err := NewConnection(client.address)
+			if err != nil {
+				return nil
+			}
+			return conn
+		},
 	}
 
-	// Monitor peer settings for concurrent streams limit updates
-	go client.monitorPeerSettings()
+	// Create initial connection
+	if err := client.createConnection(); err != nil {
+		client.cancel()
+		return nil, fmt.Errorf("failed to create initial connection: %w", err)
+	}
 
-	// Wait a bit for connection establishment
-	time.Sleep(ConnectionSetupDelay)
+	// Start request processor
+	client.wg.Add(1)
+	go client.requestProcessor()
+
+	// Start connection monitor
+	client.wg.Add(1)
+	go client.connectionMonitor()
+
+	LogConnection("client_created", address, map[string]interface{}{
+		"address": address,
+		"scheme":  scheme,
+		"timeout": client.timeout.Seconds(),
+	})
 
 	return client, nil
 }
 
-// requestWorker processes stream requests with proper ordering and concurrency control
-func (c *Client) requestWorker(workerID int) {
-	defer c.requestProcessor.Done()
+// createConnection establishes a new HTTP/2 connection
+func (c *Client) createConnection() error {
+	conn, err := NewConnection(c.address)
+	if err != nil {
+		return fmt.Errorf("connection failed: %w", err)
+	}
+
+	c.conn = conn
+
+	// Start connection frame processing
+	c.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
+		if err := conn.StartReading(); err != nil && !conn.IsClosed() {
+			LogError(err, "connection_reading_error", map[string]interface{}{
+				"address": c.address,
+			})
+		}
+	}()
+
+	return nil
+}
+
+// requestProcessor handles outgoing requests with proper ordering
+func (c *Client) requestProcessor() {
+	defer c.wg.Done()
 
 	for {
 		select {
 		case req := <-c.requestQueue:
-			c.processStreamRequest(req, workerID)
-		case <-c.shutdownChan:
+			c.processRequest(req)
+		case <-c.ctx.Done():
 			return
 		}
 	}
 }
 
-// processStreamRequest handles a single stream request with proper concurrency control
-func (c *Client) processStreamRequest(streamReq *ClientStreamRequest, workerID int) {
-	// Check if we've exceeded concurrent stream limits
-	current := atomic.LoadInt64(&c.activeStreams)
-	if uint32(current) >= c.maxConcurrentStreams {
-		// Wait for available stream slot or timeout
-		ticker := time.NewTicker(10 * time.Millisecond)
-		defer ticker.Stop()
+// processRequest handles individual HTTP/2 requests
+func (c *Client) processRequest(req *ClientRequest) {
+	atomic.AddInt64(&c.activeRequests, 1)
+	atomic.AddInt64(&c.totalRequests, 1)
+	defer atomic.AddInt64(&c.activeRequests, -1)
 
-		timeout := time.After(DefaultRequestTimeout)
-		for {
-			select {
-			case <-timeout:
-				streamReq.responseChan <- &ClientStreamResult{
-					err: fmt.Errorf("timeout waiting for available stream slot"),
-				}
-				return
-			case <-ticker.C:
-				current = atomic.LoadInt64(&c.activeStreams)
-				if uint32(current) < c.maxConcurrentStreams {
-					goto proceed
-				}
-			case <-streamReq.ctx.Done():
-				streamReq.responseChan <- &ClientStreamResult{
-					err: streamReq.ctx.Err(),
-				}
-				return
-			case <-c.shutdownChan:
-				streamReq.responseChan <- &ClientStreamResult{
-					err: fmt.Errorf("client shutting down"),
-				}
-				return
-			}
-		}
-	}
+	startTime := time.Now()
 
-proceed:
-	// Increment active stream counter
-	atomic.AddInt64(&c.activeStreams, 1)
-	c.streamWaitGroup.Add(1)
+	// Prepare headers for HTTP/2
+	headers := c.prepareHeaders(req.Method, req.URL, req.Headers)
 
-	// Process the request with proper HPACK ordering
-	response, err := c.executeStreamRequest(streamReq)
-
-	// Send result back
-	streamReq.responseChan <- &ClientStreamResult{
-		response: response,
-		err:      err,
-	}
-
-	// Cleanup - decrement active stream counter
-	atomic.AddInt64(&c.activeStreams, -1)
-	c.streamWaitGroup.Done()
-}
-
-// executeStreamRequest executes a stream request with proper HPACK synchronization
-func (c *Client) executeStreamRequest(streamReq *ClientStreamRequest) (*Response, error) {
-	// *** CRITICAL SECTION: HPACK Synchronization ***
-	// RFC 7540 Section 4.3 - HEADERS frames must be processed in order
-	// to maintain consistent HPACK compression state
-	c.streamCreationMu.Lock()
-
-	if c.conn.IsClosed() {
-		c.streamCreationMu.Unlock()
-		return nil, fmt.Errorf("connection is closed")
-	}
-
-	// Validate request
-	if err := c.validateRequest(streamReq.req); err != nil {
-		c.streamCreationMu.Unlock()
-		return nil, fmt.Errorf("invalid request: %w", err)
-	}
-
-	// Get stream ID in proper sequence
-	streamID := c.conn.GetNextStreamID()
-
-	LogStream(streamID, "idle", "sending_request", map[string]interface{}{
-		"method": streamReq.req.Method,
-		"path":   streamReq.req.Path,
-	})
-
-	// Create and send HEADERS frame with proper ordering
-	headersFrame, err := c.createHeadersFrame(streamID, streamReq.req)
+	// Create stream through connection
+	streamResp, err := c.conn.CreateStream(headers, req.Body, true)
 	if err != nil {
-		c.streamCreationMu.Unlock()
-		return nil, fmt.Errorf("failed to create headers frame: %w", err)
+		atomic.AddInt64(&c.totalErrors, 1)
+		req.Response <- &ClientResponse{
+			Error:    fmt.Errorf("failed to create stream: %w", err),
+			Duration: time.Since(startTime),
+		}
+		return
 	}
 
-	if err := c.conn.WriteFrame(headersFrame); err != nil {
-		c.streamCreationMu.Unlock()
-		return nil, fmt.Errorf("failed to send headers frame: %w", err)
+	// Convert stream response to client response
+	clientResp := &ClientResponse{
+		StatusCode: streamResp.status,
+		Headers:    streamResp.headers,
+		Body:       streamResp.body,
+		StreamID:   streamResp.streamID,
+		Duration:   time.Since(startTime),
+		Error:      streamResp.err,
 	}
 
-	// Release the critical section - HEADERS frame sent successfully
-	c.streamCreationMu.Unlock()
+	// Extract status information
+	if status, ok := streamResp.headers[PseudoHeaderStatus]; ok {
+		clientResp.Status = status
+		clientResp.StatusCode = parseStatusCode(status)
+	}
 
-	// Send DATA frame(s) if request has body (can be done outside critical section)
-	if len(streamReq.req.Body) > 0 {
-		if err := c.sendDataFrames(streamID, streamReq.req.Body); err != nil {
-			return nil, fmt.Errorf("failed to send data frames: %w", err)
+	// Send response back
+	req.Response <- clientResp
+}
+
+// prepareHeaders converts HTTP/1.1 style headers to HTTP/2 format
+func (c *Client) prepareHeaders(method, url string, headers map[string]string) map[string]string {
+	h2Headers := make(map[string]string)
+
+	// Add pseudo-headers first (required by HTTP/2)
+	h2Headers[PseudoHeaderMethod] = method
+	h2Headers[PseudoHeaderScheme] = c.scheme
+
+	// Parse URL for path and authority
+	path, authority := parseURL(url)
+	h2Headers[PseudoHeaderPath] = path
+	h2Headers[PseudoHeaderAuthority] = authority
+
+	// Add default headers
+	for name, value := range c.defaultHeaders {
+		if !isConnectionSpecificHeader(name) {
+			h2Headers[name] = value
 		}
 	}
 
-	// Wait for complete response
-	return c.waitForResponse(streamID)
-}
-
-// monitorPeerSettings monitors peer settings changes to update concurrency limits
-func (c *Client) monitorPeerSettings() {
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			if maxStreams, exists := c.conn.GetPeerSetting(SettingsMaxConcurrentStreams); exists {
-				if maxStreams > 0 && maxStreams != c.maxConcurrentStreams {
-					c.maxConcurrentStreams = maxStreams
-				}
-			}
-		case <-c.shutdownChan:
-			return
-		}
-	}
-}
-
-// SendRequest sends an HTTP/2 request with proper concurrency management
-func (c *Client) SendRequest(req *Request) (*Response, error) {
-	return c.SendRequestWithContext(context.Background(), req)
-}
-
-// SendRequestWithContext sends an HTTP/2 request with context and proper concurrency management
-func (c *Client) SendRequestWithContext(ctx context.Context, req *Request) (*Response, error) {
-	if c.conn.IsClosed() {
-		return nil, fmt.Errorf("connection is closed")
-	}
-
-	// Create stream request for queuing
-	streamReq := &ClientStreamRequest{
-		req:          req,
-		responseChan: make(chan *ClientStreamResult, 1),
-		ctx:          ctx,
-	}
-
-	// Queue the request for processing
-	select {
-	case c.requestQueue <- streamReq:
-		// Request queued successfully
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case <-c.shutdownChan:
-		return nil, fmt.Errorf("client shutting down")
-	}
-
-	// Wait for result
-	select {
-	case result := <-streamReq.responseChan:
-		return result.response, result.err
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case <-c.shutdownChan:
-		return nil, fmt.Errorf("client shutting down")
-	}
-}
-
-// // SendRequest sends an HTTP/2 request and waits for the response
-// func (c *Client) SendRequest(req *Request) (*Response, error) {
-// 	if c.conn.IsClosed() {
-// 		return nil, fmt.Errorf("connection is closed")
-// 	}
-
-// 	// Validate request
-// 	if err := c.validateRequest(req); err != nil {
-// 		return nil, fmt.Errorf("invalid request: %w", err)
-// 	}
-
-// 	streamID := c.conn.GetNextStreamID()
-
-// 	LogStream(streamID, "idle", "sending_request", map[string]interface{}{
-// 		"method": req.Method,
-// 		"path":   req.Path,
-// 	})
-
-// 	// Create and send HEADERS frame
-// 	headersFrame, err := c.createHeadersFrame(streamID, req)
-// 	if err != nil {
-// 		return nil, fmt.Errorf("failed to create headers frame: %w", err)
-// 	}
-
-// 	if err := c.conn.WriteFrame(headersFrame); err != nil {
-// 		return nil, fmt.Errorf("failed to send headers frame: %w", err)
-// 	}
-
-// 	// Send DATA frame(s) if request has body
-// 	if len(req.Body) > 0 {
-// 		if err := c.sendDataFrames(streamID, req.Body); err != nil {
-// 			return nil, fmt.Errorf("failed to send data frames: %w", err)
-// 		}
-// 	}
-
-// 	// Wait for complete response
-// 	return c.waitForResponse(streamID)
-// }
-
-// validateRequest validates the HTTP/2 request
-func (c *Client) validateRequest(req *Request) error {
-	if req.Method == "" {
-		return fmt.Errorf("method is required")
-	}
-
-	if req.Path == "" {
-		return fmt.Errorf("path is required")
-	}
-
-	if req.Authority == "" {
-		return fmt.Errorf("authority is required")
-	}
-
-	if req.Scheme == "" {
-		req.Scheme = SchemeHTTP // Default to cleartext HTTP/2
-	}
-
-	// Validate method
-	validMethods := map[string]bool{
-		MethodGET:     true,
-		MethodPOST:    true,
-		MethodPUT:     true,
-		MethodDELETE:  true,
-		MethodHEAD:    true,
-		MethodOPTIONS: true,
-		MethodPATCH:   true,
-		MethodCONNECT: true,
-	}
-	if !validMethods[strings.ToUpper(req.Method)] {
-		return fmt.Errorf("invalid HTTP method: %s", req.Method)
-	}
-
-	// Initialize headers map if nil
-	if req.Headers == nil {
-		req.Headers = make(map[string]string)
-	}
-
-	// Add content-length for requests with body
-	if len(req.Body) > 0 {
-		req.Headers[HeaderContentLength] = fmt.Sprintf("%d", len(req.Body))
-	}
-
-	return nil
-}
-
-// createHeadersFrame creates a HEADERS frame for the request
-func (c *Client) createHeadersFrame(streamID uint32, req *Request) (*Frame, error) {
-	// Build header map with HTTP/2 pseudo-headers first
-	headers := make(map[string]string)
-
-	// Pseudo-headers as per RFC 7540 Section 8.1.2.3
-	headers[PseudoHeaderMethod] = strings.ToUpper(req.Method)
-	headers[PseudoHeaderPath] = req.Path
-	headers[PseudoHeaderScheme] = req.Scheme
-	headers[PseudoHeaderAuthority] = req.Authority
-
-	// Add regular headers (convert to lowercase as per HTTP/2 spec)
-	for name, value := range req.Headers {
-		headerName := strings.ToLower(name)
-		// Skip pseudo-headers if accidentally included in regular headers
-		if !strings.HasPrefix(headerName, ":") {
-			headers[headerName] = value
+	// Add request-specific headers
+	for name, value := range headers {
+		if !isConnectionSpecificHeader(name) && !isPseudoHeader(name) {
+			h2Headers[name] = value
 		}
 	}
 
-	// Encode headers using HPACK (connection handles HPACK synchronization)
-	payload, err := c.conn.headerEncoder.Encode(headers)
-	if err != nil {
-		return nil, fmt.Errorf("HPACK encoding failed: %w", err)
-	}
-
-	// Set appropriate flags
-	flags := FlagHeadersEndHeaders
-	if len(req.Body) == 0 {
-		flags |= FlagHeadersEndStream
-	}
-
-	frame := &Frame{
-		Length:   uint32(len(payload)),
-		Type:     FrameTypeHEADERS,
-		Flags:    uint8(flags),
-		StreamID: streamID,
-		Payload:  payload,
-	}
-
-	// Create stream in connection tracking
-	stream := c.conn.CreateStream(streamID)
-	stream.mu.Lock()
-	stream.State = StreamStateOpen
-	stream.mu.Unlock()
-
-	return frame, nil
+	return h2Headers
 }
 
-// sendDataFrames sends DATA frames for the request body
-func (c *Client) sendDataFrames(streamID uint32, data []byte) error {
-	// Get peer's maximum frame size setting
-	maxFrameSize, exists := c.conn.GetPeerSetting(SettingsMaxFrameSize)
-	if !exists {
-		maxFrameSize = DefaultMaxFrameSize // Default per RFC 7540
+// parseURL extracts path and authority from URL
+func parseURL(url string) (path, authority string) {
+	// Simple URL parsing for HTTP/2
+	if url == "" || url[0] == '/' {
+		return url, ""
 	}
 
-	// Send data in chunks respecting max frame size
-	offset := 0
-	for offset < len(data) {
-		// Calculate chunk size
-		chunkSize := int(maxFrameSize)
-		if offset+chunkSize > len(data) {
-			chunkSize = len(data) - offset
+	// For full URLs, extract components
+	// This is a simplified version - production code should use net/url
+	if idx := findString(url, "://"); idx != -1 {
+		remaining := url[idx+3:]
+		if slashIdx := findString(remaining, "/"); slashIdx != -1 {
+			authority = remaining[:slashIdx]
+			path = remaining[slashIdx:]
+		} else {
+			authority = remaining
+			path = "/"
 		}
-
-		// Determine if this is the last frame
-		isLast := (offset + chunkSize) >= len(data)
-
-		// Create DATA frame
-		flags := uint8(0)
-		if isLast {
-			flags |= FlagDataEndStream
-		}
-
-		frame := &Frame{
-			Length:   uint32(chunkSize),
-			Type:     FrameTypeDATA,
-			Flags:    flags,
-			StreamID: streamID,
-			Payload:  data[offset : offset+chunkSize],
-		}
-
-		// Send frame (WriteFrame handles flow control)
-		if err := c.conn.WriteFrame(frame); err != nil {
-			return fmt.Errorf("failed to send DATA frame: %w", err)
-		}
-
-		offset += chunkSize
+	} else {
+		path = url
 	}
 
-	return nil
+	if path == "" {
+		path = "/"
+	}
+
+	return path, authority
 }
 
-// waitForResponse waits for a complete response on the specified stream
-func (c *Client) waitForResponse(streamID uint32) (*Response, error) {
-	timeout := time.After(DefaultRequestTimeout)
-	ticker := time.NewTicker(ResponsePollingInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-c.conn.CloseChan():
-			return nil, fmt.Errorf("connection closed while waiting for response")
-		case <-timeout:
-			// Send RST_STREAM to cancel the request
-			c.conn.SendRstStream(streamID, ErrorCodeCancel)
-			return nil, fmt.Errorf("request timeout for stream %d", streamID)
-		case <-ticker.C:
-			stream, exists := c.conn.GetStream(streamID)
-			if !exists {
-				continue
-			}
-
-			stream.mu.Lock()
-			endStream := stream.EndStream
-			// Copy headers and data to avoid race conditions
-			headers := make(map[string]string)
-			for k, v := range stream.Headers {
-				headers[k] = v
-			}
-			body := make([]byte, len(stream.Data))
-			copy(body, stream.Data)
-			stream.mu.Unlock()
-
-			// Check if we have a complete response
-			if endStream && len(headers) > 0 {
-				response := &Response{
-					Headers: headers,
-					Body:    body,
-				}
-
-				// Extract status information
-				if status, ok := headers[PseudoHeaderStatus]; ok {
-					response.Status = status
-					response.StatusCode = parseStatusCode(status)
-				}
-
-				// Clean up completed stream
-				c.conn.streamsMu.Lock()
-				delete(c.conn.streams, streamID)
-				c.conn.streamsMu.Unlock()
-
-				return response, nil
-			}
+// findString is a simple string search helper
+func findString(s, substr string) int {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return i
 		}
+	}
+	return -1
+}
+
+// isConnectionSpecificHeader checks if header should be excluded from HTTP/2
+func isConnectionSpecificHeader(name string) bool {
+	switch name {
+	case "connection", "keep-alive", "proxy-connection",
+		"transfer-encoding", "upgrade":
+		return true
+	default:
+		return false
 	}
 }
 
-// parseStatusCode extracts numeric status code from status string
+// isPseudoHeader checks if header is an HTTP/2 pseudo-header
+func isPseudoHeader(name string) bool {
+	return len(name) > 0 && name[0] == ':'
+}
+
+// parseStatusCode converts status string to integer
 func parseStatusCode(status string) int {
 	switch status {
+	case "100":
+		return 100
+	case "101":
+		return 101
 	case "200":
-		return StatusOK
+		return 200
 	case "201":
-		return StatusCreated
+		return 201
+	case "202":
+		return 202
 	case "204":
-		return StatusNoContent
+		return 204
 	case "206":
-		return StatusPartialContent
+		return 206
+	case "300":
+		return 300
+	case "301":
+		return 301
+	case "302":
+		return 302
 	case "304":
-		return StatusNotModified
+		return 304
+	case "307":
+		return 307
+	case "308":
+		return 308
 	case "400":
-		return StatusBadRequest
+		return 400
 	case "401":
-		return StatusUnauthorized
+		return 401
 	case "403":
-		return StatusForbidden
+		return 403
 	case "404":
-		return StatusNotFound
+		return 404
 	case "405":
-		return StatusMethodNotAllowed
+		return 405
 	case "409":
-		return StatusConflict
+		return 409
+	case "410":
+		return 410
+	case "412":
+		return 412
+	case "413":
+		return 413
+	case "415":
+		return 415
+	case "429":
+		return 429
 	case "500":
-		return StatusInternalServerError
+		return 500
+	case "501":
+		return 501
 	case "502":
-		return StatusBadGateway
+		return 502
 	case "503":
-		return StatusServiceUnavailable
+		return 503
 	case "504":
-		return StatusGatewayTimeout
+		return 504
 	default:
-		// Try to parse as integer
+		// Try parsing as number
 		var code int
 		fmt.Sscanf(status, "%d", &code)
 		return code
 	}
 }
 
-// GET sends a GET request with automatic concurrency management
+// GET performs an HTTP GET request
 func (c *Client) GET(path, authority string) (*Response, error) {
-	req := &Request{
-		Method:    MethodGET,
-		Path:      path,
-		Authority: authority,
-		Scheme:    SchemeHTTP,
-		Headers:   make(map[string]string),
-	}
-	return c.SendRequest(req)
+	return c.Request(MethodGET, path, authority, nil, nil)
 }
 
-// POST sends a POST request with body and proper concurrency management
-func (c *Client) POST(path, authority string, body []byte, contentType string) (*Response, error) {
-	headers := make(map[string]string)
-	if contentType != "" {
-		headers[HeaderContentType] = contentType
+// POST performs an HTTP POST request
+func (c *Client) POST(path, authority string, body []byte) (*Response, error) {
+	headers := map[string]string{
+		HeaderContentType: "application/octet-stream",
 	}
-
-	req := &Request{
-		Method:    MethodPOST,
-		Path:      path,
-		Authority: authority,
-		Scheme:    SchemeHTTP,
-		Headers:   headers,
-		Body:      body,
-	}
-	return c.SendRequest(req)
+	return c.Request(MethodPOST, path, authority, headers, body)
 }
 
-// PUT sends a PUT request with body and proper concurrency management
-func (c *Client) PUT(path, authority string, body []byte, contentType string) (*Response, error) {
-	headers := make(map[string]string)
-	if contentType != "" {
-		headers[HeaderContentType] = contentType
+// PUT performs an HTTP PUT request
+func (c *Client) PUT(path, authority string, body []byte) (*Response, error) {
+	headers := map[string]string{
+		HeaderContentType: "application/octet-stream",
 	}
-
-	req := &Request{
-		Method:    MethodPUT,
-		Path:      path,
-		Authority: authority,
-		Scheme:    SchemeHTTP,
-		Headers:   headers,
-		Body:      body,
-	}
-	return c.SendRequest(req)
+	return c.Request(MethodPUT, path, authority, headers, body)
 }
 
-// DELETE sends a DELETE request with proper concurrency management
+// DELETE performs an HTTP DELETE request
 func (c *Client) DELETE(path, authority string) (*Response, error) {
-	req := &Request{
-		Method:    MethodDELETE,
-		Path:      path,
-		Authority: authority,
-		Scheme:    SchemeHTTP,
-		Headers:   make(map[string]string),
-	}
-	return c.SendRequest(req)
+	return c.Request(MethodDELETE, path, authority, nil, nil)
 }
 
-// HEAD sends a HEAD request with proper concurrency management
-func (c *Client) HEAD(path, authority string) (*Response, error) {
-	req := &Request{
-		Method:    MethodHEAD,
-		Path:      path,
-		Authority: authority,
-		Scheme:    SchemeHTTP,
-		Headers:   make(map[string]string),
-	}
-	return c.SendRequest(req)
-}
-
-// PATCH sends a PATCH request with body and proper concurrency management
-func (c *Client) PATCH(path, authority string, body []byte, contentType string) (*Response, error) {
-	headers := make(map[string]string)
-	if contentType != "" {
-		headers[HeaderContentType] = contentType
+// Request performs a generic HTTP request
+func (c *Client) Request(method, path, authority string, headers map[string]string, body []byte) (*Response, error) {
+	if atomic.LoadInt32(&c.closed) != 0 {
+		return nil, fmt.Errorf("client is closed")
 	}
 
-	req := &Request{
-		Method:    MethodPATCH,
-		Path:      path,
-		Authority: authority,
-		Scheme:    SchemeHTTP,
-		Headers:   headers,
-		Body:      body,
+	// Build full URL
+	url := path
+	if authority != "" && path != "" && path[0] == '/' {
+		url = path // Keep as path for HTTP/2
 	}
-	return c.SendRequest(req)
-}
 
-// OPTIONS sends an OPTIONS request with proper concurrency management
-func (c *Client) OPTIONS(path, authority string) (*Response, error) {
-	req := &Request{
-		Method:    MethodOPTIONS,
-		Path:      path,
-		Authority: authority,
-		Scheme:    SchemeHTTP,
-		Headers:   make(map[string]string),
+	// Create request
+	req := &ClientRequest{
+		Method:   method,
+		URL:      url,
+		Headers:  headers,
+		Body:     body,
+		Timeout:  c.timeout,
+		Context:  c.ctx,
+		Response: make(chan *ClientResponse, 1),
 	}
-	return c.SendRequest(req)
+
+	// Queue request
+	select {
+	case c.requestQueue <- req:
+	case <-time.After(1 * time.Second):
+		return nil, fmt.Errorf("request queue timeout")
+	case <-c.ctx.Done():
+		return nil, fmt.Errorf("client closed")
+	}
+
+	// Wait for response
+	select {
+	case resp := <-req.Response:
+		if resp.Error != nil {
+			return nil, resp.Error
+		}
+
+		// Convert to standard Response format
+		return &Response{
+			Status:     resp.Status,
+			StatusCode: resp.StatusCode,
+			Headers:    resp.Headers,
+			Body:       resp.Body,
+		}, nil
+
+	case <-time.After(c.timeout):
+		return nil, fmt.Errorf("request timeout after %v", c.timeout)
+
+	case <-c.ctx.Done():
+		return nil, fmt.Errorf("client closed")
+	}
 }
 
-// GetActiveStreamCount returns the current number of active streams
-func (c *Client) GetActiveStreamCount() int64 {
-	return atomic.LoadInt64(&c.activeStreams)
+// SetTimeout sets the default request timeout
+func (c *Client) SetTimeout(timeout time.Duration) {
+	c.timeout = timeout
 }
 
-// GetMaxConcurrentStreams returns the current max concurrent streams limit
-func (c *Client) GetMaxConcurrentStreams() uint32 {
-	return c.maxConcurrentStreams
+// SetUserAgent sets the User-Agent header
+func (c *Client) SetUserAgent(userAgent string) {
+	c.userAgent = userAgent
+	c.defaultHeaders[HeaderUserAgent] = userAgent
 }
 
-// Close gracefully closes the client connection
+// SetDefaultHeader sets a default header for all requests
+func (c *Client) SetDefaultHeader(name, value string) {
+	if !isConnectionSpecificHeader(name) {
+		c.defaultHeaders[name] = value
+	}
+}
+
+// GetStats returns client performance statistics
+func (c *Client) GetStats() map[string]interface{} {
+	return map[string]interface{}{
+		"active_requests":  atomic.LoadInt64(&c.activeRequests),
+		"total_requests":   atomic.LoadInt64(&c.totalRequests),
+		"total_errors":     atomic.LoadInt64(&c.totalErrors),
+		"uptime_seconds":   time.Since(c.startTime).Seconds(),
+		"connection_stats": c.conn.GetStats(),
+	}
+}
+
+// connectionMonitor monitors connection health
+func (c *Client) connectionMonitor() {
+	defer c.wg.Done()
+
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			// Check connection health
+			if c.conn != nil && c.conn.IsClosed() {
+				// Attempt to reconnect
+				if err := c.createConnection(); err != nil {
+					LogError(err, "connection_reconnect_failed", map[string]interface{}{
+						"address": c.address,
+					})
+				}
+			}
+
+		case <-c.ctx.Done():
+			return
+		}
+	}
+}
+
+// Close gracefully closes the client and all connections
 func (c *Client) Close() error {
-	c.shutdownOnce.Do(func() {
-		close(c.shutdownChan)
+	c.closeOnce.Do(func() {
+		atomic.StoreInt32(&c.closed, 1)
 
-		// Wait for all active streams to complete
-		c.streamWaitGroup.Wait()
+		// Cancel context to stop all goroutines
+		c.cancel()
 
-		// Wait for request processors to finish
-		c.requestProcessor.Wait()
+		// Close connection
+		if c.conn != nil {
+			c.conn.Close()
+		}
+
+		// Close request queue
+		close(c.requestQueue)
+
+		// Wait for all goroutines to finish
+		c.wg.Wait()
+
+		LogConnection("client_closed", c.address, map[string]interface{}{
+			"address":        c.address,
+			"uptime_seconds": time.Since(c.startTime).Seconds(),
+			"total_requests": atomic.LoadInt64(&c.totalRequests),
+			"total_errors":   atomic.LoadInt64(&c.totalErrors),
+		})
 	})
 
-	if c.conn != nil {
-		return c.conn.Close()
-	}
 	return nil
 }
 
-// IsConnected returns whether the client connection is active
-func (c *Client) IsConnected() bool {
-	return c.conn != nil && !c.conn.IsClosed()
-}
-
-// Ping sends a PING frame to test connection liveness
-func (c *Client) Ping() error {
-	if c.conn.IsClosed() {
-		return fmt.Errorf("connection is closed")
+// SendRequest is a compatibility method for existing code
+func (c *Client) SendRequest(req *Request) (*Response, error) {
+	headers := make(map[string]string)
+	for k, v := range req.Headers {
+		headers[k] = v
 	}
 
-	pingData := []byte(DefaultPingData)
-	// Pad to 8 bytes as required by HTTP/2 PING frame
-	if len(pingData) < PingFrameSize {
-		paddedData := make([]byte, PingFrameSize)
-		copy(paddedData, pingData)
-		pingData = paddedData
-	}
-
-	return c.conn.SendPing(pingData)
-}
-
-// GetConnectionInfo returns comprehensive information about the connection
-func (c *Client) GetConnectionInfo() map[string]interface{} {
-	info := make(map[string]interface{})
-
-	info["connected"] = !c.conn.IsClosed()
-	info["connection_window"] = c.conn.GetConnectionWindow()
-	info["peer_connection_window"] = c.conn.GetPeerConnectionWindow()
-	info["active_streams"] = c.GetActiveStreamCount()
-	info["max_concurrent_streams"] = c.GetMaxConcurrentStreams()
-
-	// Get peer settings information
-	settings := make(map[string]uint32)
-	if maxFrameSize, exists := c.conn.GetPeerSetting(SettingsMaxFrameSize); exists {
-		settings["max_frame_size"] = maxFrameSize
-	}
-	if initialWindowSize, exists := c.conn.GetPeerSetting(SettingsInitialWindowSize); exists {
-		settings["initial_window_size"] = initialWindowSize
-	}
-	if headerTableSize, exists := c.conn.GetPeerSetting(SettingsHeaderTableSize); exists {
-		settings["header_table_size"] = headerTableSize
-	}
-	if enablePush, exists := c.conn.GetPeerSetting(SettingsEnablePush); exists {
-		settings["enable_push"] = enablePush
-	}
-	if maxConcurrentStreams, exists := c.conn.GetPeerSetting(SettingsMaxConcurrentStreams); exists {
-		settings["max_concurrent_streams"] = maxConcurrentStreams
-	}
-
-	info["peer_settings"] = settings
-
-	return info
-}
-
-// SetHeader sets a header for subsequent requests (this would be used with a request builder pattern)
-func (req *Request) SetHeader(name, value string) *Request {
-	if req.Headers == nil {
-		req.Headers = make(map[string]string)
-	}
-	req.Headers[name] = value
-	return req
-}
-
-// AddHeaders adds multiple headers to the request
-func (req *Request) AddHeaders(headers map[string]string) *Request {
-	if req.Headers == nil {
-		req.Headers = make(map[string]string)
-	}
-	for name, value := range headers {
-		req.Headers[name] = value
-	}
-	return req
-}
-
-// WithBody sets the request body
-func (req *Request) WithBody(body []byte) *Request {
-	req.Body = body
-	return req
+	return c.Request(req.Method, req.Path, req.Authority, headers, req.Body)
 }

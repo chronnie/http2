@@ -81,6 +81,53 @@ type Request struct {
 	Body      []byte
 }
 
+// NewRequest creates a new HTTP/2 request
+func NewRequest(method, path string) *Request {
+	return &Request{
+		Method:  method,
+		Path:    path,
+		Headers: make(map[string]string),
+	}
+}
+
+// WithHeader adds a header to the request
+func (req *Request) WithHeader(name, value string) *Request {
+	if req.Headers == nil {
+		req.Headers = make(map[string]string)
+	}
+	req.Headers[name] = value
+	return req
+}
+
+// AddHeaders adds multiple headers to the request
+func (req *Request) AddHeaders(headers map[string]string) *Request {
+	if req.Headers == nil {
+		req.Headers = make(map[string]string)
+	}
+	for name, value := range headers {
+		req.Headers[name] = value
+	}
+	return req
+}
+
+// WithBody sets the request body
+func (req *Request) WithBody(body []byte) *Request {
+	req.Body = body
+	return req
+}
+
+// WithAuthority sets the authority pseudo-header
+func (req *Request) WithAuthority(authority string) *Request {
+	req.Authority = authority
+	return req
+}
+
+// WithScheme sets the scheme pseudo-header
+func (req *Request) WithScheme(scheme string) *Request {
+	req.Scheme = scheme
+	return req
+}
+
 // Response represents an HTTP/2 response
 type Response struct {
 	Status     string
