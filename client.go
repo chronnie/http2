@@ -84,12 +84,12 @@ type Client struct {
 	startTime      time.Time
 
 	// Connection pool for future extension
-	connPool   sync.Pool
-	connPoolMu sync.RWMutex
+	connPool sync.Pool
+	// connPoolMu sync.RWMutex
 
 	// Request processing
-	requestQueue     chan *ClientRequest
-	responseChannels sync.Map // map[uint32]chan *ClientResponse
+	requestQueue chan *ClientRequest
+	// responseChannels sync.Map // map[uint32]chan *ClientResponse
 
 	// Lifecycle management
 	ctx       context.Context
@@ -191,10 +191,22 @@ func NewClient(address string) (*Client, error) {
 
 // createConnection establishes a new HTTP/2 connection
 func (c *Client) createConnection() error {
+	LogConnection("establishing", c.address, map[string]interface{}{
+		"address": c.address,
+		"scheme":  c.scheme,
+	})
+
 	conn, err := NewConnection(c.address)
 	if err != nil {
+		LogError(err, "connection_failed", map[string]interface{}{
+			"address": c.address,
+		})
 		return fmt.Errorf("connection failed: %w", err)
 	}
+
+	LogConnection("established", c.address, map[string]interface{}{
+		"success": true,
+	})
 
 	c.conn = conn
 
@@ -228,6 +240,7 @@ func (c *Client) requestProcessor() {
 
 // processRequest handles individual HTTP/2 requests
 func (c *Client) processRequest(req *ClientRequest) {
+	LogRequest(req.Method, req.URL, "", req.Headers)
 	atomic.AddInt64(&c.activeRequests, 1)
 	atomic.AddInt64(&c.totalRequests, 1)
 	defer atomic.AddInt64(&c.activeRequests, -1)
@@ -240,6 +253,10 @@ func (c *Client) processRequest(req *ClientRequest) {
 	// Create stream through connection
 	streamResp, err := c.conn.CreateStream(headers, req.Body, true)
 	if err != nil {
+		LogError(err, "request_failed", map[string]interface{}{
+			"method": req.Method,
+			"url":    req.URL,
+		})
 		atomic.AddInt64(&c.totalErrors, 1)
 		req.Response <- &ClientResponse{
 			Error:    fmt.Errorf("failed to create stream: %w", err),
@@ -263,7 +280,7 @@ func (c *Client) processRequest(req *ClientRequest) {
 		clientResp.Status = status
 		clientResp.StatusCode = parseStatusCode(status)
 	}
-
+	LogResponse(clientResp.StatusCode, clientResp.Headers, len(clientResp.Body))
 	// Send response back
 	req.Response <- clientResp
 }

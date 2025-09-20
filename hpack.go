@@ -89,12 +89,12 @@ var (
 // Common header patterns cache
 var (
 	commonHeadersCache = sync.Map{}
-	bufferPool         = sync.Pool{
-		New: func() interface{} {
-			buf := make([]byte, 0, 1024)
-			return &buf
-		},
-	}
+	// bufferPool         = sync.Pool{
+	// 	New: func() interface{} {
+	// 		buf := make([]byte, 0, 1024)
+	// 		return &buf
+	// 	},
+	// }
 	encoderPool = sync.Pool{
 		New: func() interface{} {
 			return &HPACKEncoder{

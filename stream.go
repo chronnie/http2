@@ -218,7 +218,9 @@ func (s *Stream) GetState() StreamState {
 // SetState atomically updates the stream state with validation
 func (s *Stream) SetState(newState StreamState) error {
 	oldState := StreamState(atomic.LoadInt32(&s.state))
-
+	LogStream(s.ID, newState.String(), "state_change", map[string]interface{}{
+		"old_state": oldState.String(),
+	})
 	// Validate state transition according to RFC 7540 Section 5.1
 	if !s.isValidTransition(oldState, newState) {
 		return fmt.Errorf("invalid state transition from %s to %s for stream %d",
@@ -359,9 +361,10 @@ func (s *Stream) ReceiveData(data []byte, endStream bool) error {
 
 	// Handle end of stream
 	if endStream {
-		if state == StreamStateOpen {
+		switch state {
+		case StreamStateOpen:
 			s.SetState(StreamStateHalfClosedRemote)
-		} else if state == StreamStateHalfClosedLocal {
+		case StreamStateHalfClosedLocal:
 			s.SetState(StreamStateClosed)
 		}
 		s.notifyCompletion()

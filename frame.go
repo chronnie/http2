@@ -14,6 +14,33 @@ const (
 	FrameTypeCONTINUATION  = 0x9
 )
 
+func getFrame(frameType uint8) string {
+	switch frameType {
+	case FrameTypeDATA:
+		return "FRAME_DATA"
+	case FrameTypeHEADERS:
+		return "FRAME_HEADERS"
+	case FrameTypePRIORITY:
+		return "FRAME_PRIORITY"
+	case FrameTypeRST_STREAM:
+		return "FRAME_RST_STREAM"
+	case FrameTypeSETTINGS:
+		return "FRAME_SETTINGS"
+	case FrameTypePUSH_PROMISE:
+		return "FRAME_PUSH_PROMISE"
+	case FrameTypePING:
+		return "FRAME_PING"
+	case FrameTypeGOAWAY:
+		return "FRAME_GOAWAY"
+	case FrameTypeWINDOW_UPDATE:
+		return "FRAME_WINDOW_UPDATE"
+	case FrameTypeCONTINUATION:
+		return "FRAME_CONTINUATION"
+	default:
+		return ""
+	}
+}
+
 // Flags for different frame types
 const (
 	FlagDataEndStream     = 0x1

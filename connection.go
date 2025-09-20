@@ -169,10 +169,16 @@ type Connection struct {
 
 // NewConnection creates a new optimized HTTP/2 connection
 func NewConnection(address string) (*Connection, error) {
+	LogConnection("creating", address, map[string]interface{}{
+		"address": address,
+	})
 	// Establish TCP connection with optimized settings
 	tcpConn, err := net.DialTimeout("tcp", address, 10*time.Second)
 	if err != nil {
-		return nil, fmt.Errorf("failed to dial %s: %w", address, err)
+		LogError(err, "tcp_dial_failed", map[string]interface{}{
+			"address": address,
+		})
+		return nil, fmt.Errorf("failed to dial %s: %v", address, err)
 	}
 
 	// Configure TCP options for optimal performance
@@ -433,25 +439,21 @@ func (c *Connection) handleIncomingFrame(frame *Frame, workerID int) {
 		}
 	}()
 
+	LogFrame(getFrame(frame.Type), frame.StreamID, int(frame.Length), string(frame.Flags))
+
 	switch frame.Type {
 	case FrameTypeDATA:
 		c.handleDataFrame(frame)
-
 	case FrameTypeHEADERS:
 		c.handleHeadersFrame(frame)
-
 	case FrameTypeSETTINGS:
 		c.handleSettingsFrame(frame)
-
 	case FrameTypeWINDOW_UPDATE:
 		c.handleWindowUpdateFrame(frame)
-
 	case FrameTypePING:
 		c.handlePingFrame(frame)
-
 	case FrameTypeGOAWAY:
 		c.handleGoAwayFrame(frame)
-
 	case FrameTypeRST_STREAM:
 		c.handleRstStreamFrame(frame)
 
@@ -726,6 +728,7 @@ func (c *Connection) createStreamWithID(streamID uint32) *Stream {
 
 // writeFrame queues a frame for asynchronous writing
 func (c *Connection) writeFrame(frame *Frame) error {
+	LogFrame(getFrame(frame.Type), frame.StreamID, int(frame.Length), string(frame.Flags))
 	if atomic.LoadInt32(&c.isClosed) != 0 {
 		return fmt.Errorf("connection is closed")
 	}
@@ -853,7 +856,14 @@ func (c *Connection) createSettingsFrame(ack bool) *Frame {
 
 // handleSettingsFrame processes incoming SETTINGS frames
 func (c *Connection) handleSettingsFrame(frame *Frame) {
-	if (frame.Flags & FlagSettingsAck) != 0 {
+	isAck := (frame.Flags & FlagSettingsAck) != 0
+	LogSettings(map[string]interface{}{
+		"frame_length": frame.Length,
+		"connection":   c.remoteAdd,
+		"timestamp":    time.Now(),
+	}, isAck)
+
+	if isAck {
 		// SETTINGS ACK frame - no payload processing needed
 		LogSettings(nil, true)
 		return
@@ -1170,6 +1180,11 @@ func (c *Connection) GetStats() ConnectionStats {
 // Close gracefully closes the connection with proper cleanup
 func (c *Connection) Close() error {
 	c.shutdownOnce.Do(func() {
+		LogConnection("closing", c.remoteAdd, map[string]interface{}{
+			"active_streams": c.lastStreamID,
+			"bytes_sent":     atomic.LoadInt64(&c.stats.BytesSent),
+			"bytes_received": atomic.LoadInt64(&c.stats.BytesReceived),
+		})
 		atomic.StoreInt32(&c.isClosed, 1)
 
 		// Cancel shutdown context to stop all goroutines
