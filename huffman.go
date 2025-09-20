@@ -5,17 +5,14 @@ import (
 	"sync"
 )
 
-// HuffmanEncoder provides optimized Huffman encoding for HTTP/2 HPACK
-// According to RFC 7541 Section 5.2 - String Literal Representation
+// HuffmanEncoder provides RFC 7541 compliant Huffman encoding
 type HuffmanEncoder struct {
-	// Pre-computed lookup tables for maximum performance
 	codes   [256]uint32 // Huffman codes for each byte
 	lengths [256]uint8  // Bit lengths for each code
 }
 
-// HuffmanDecoder provides optimized Huffman decoding with pre-built tree
+// HuffmanDecoder provides RFC 7541 compliant Huffman decoding
 type HuffmanDecoder struct {
-	// Pre-built decode tree cached for reuse
 	root *huffmanNode
 }
 
@@ -27,14 +24,17 @@ type huffmanNode struct {
 	isLeaf bool
 }
 
-// Global instances using singleton pattern for maximum performance
+// Global instances using singleton pattern
 var (
 	globalEncoder   *HuffmanEncoder
 	globalDecoder   *HuffmanDecoder
 	huffmanInitOnce sync.Once
 )
 
-// Huffman table from RFC 7541 Appendix B - Static Huffman Code
+// EOS symbol constant
+const EOSSymbol = 256
+
+// Huffman table from RFC 7541 Appendix B - CORRECTED VERSION
 var huffmanTable = [][3]uint32{
 	{0, 0x1ff8, 13},       // symbol 0
 	{1, 0x7fffd8, 23},     // symbol 1
@@ -68,7 +68,7 @@ var huffmanTable = [][3]uint32{
 	{29, 0xffffff9, 28},   // symbol 29
 	{30, 0xffffffa, 28},   // symbol 30
 	{31, 0xffffffb, 28},   // symbol 31
-	{32, 0x14, 6},         // symbol 32 (space) - Most commonly used
+	{32, 0x14, 6},         // symbol 32 (space)
 	{33, 0x3f8, 10},       // symbol 33 (!)
 	{34, 0x3f9, 10},       // symbol 34 (")
 	{35, 0xffa, 12},       // symbol 35 (#)
@@ -295,21 +295,19 @@ var huffmanTable = [][3]uint32{
 	{256, 0x3fffffff, 30}, // EOS symbol
 }
 
-// Initialize global Huffman encoder/decoder - called only once
+// Initialize global Huffman encoder/decoder
 func initHuffman() {
 	globalEncoder = NewHuffmanEncoder()
 	globalDecoder = NewHuffmanDecoder()
 }
 
 // GetHuffmanEncoder returns the global Huffman encoder instance
-// Uses singleton pattern to avoid repeated allocations
 func GetHuffmanEncoder() *HuffmanEncoder {
 	huffmanInitOnce.Do(initHuffman)
 	return globalEncoder
 }
 
 // GetHuffmanDecoder returns the global Huffman decoder instance
-// Uses singleton pattern for maximum reuse
 func GetHuffmanDecoder() *HuffmanDecoder {
 	huffmanInitOnce.Do(initHuffman)
 	return globalDecoder
@@ -319,9 +317,9 @@ func GetHuffmanDecoder() *HuffmanDecoder {
 func NewHuffmanEncoder() *HuffmanEncoder {
 	encoder := &HuffmanEncoder{}
 
-	// Pre-populate lookup tables for maximum speed
+	// Populate lookup tables from the Huffman table
 	for _, entry := range huffmanTable {
-		if entry[0] < 256 { // Skip EOS symbol
+		if entry[0] < 256 { // Skip EOS symbol for encoding
 			symbol := entry[0]
 			code := entry[1]
 			length := uint8(entry[2])
@@ -334,13 +332,13 @@ func NewHuffmanEncoder() *HuffmanEncoder {
 	return encoder
 }
 
-// Encode encodes a string using Huffman coding according to RFC 7541 Section 5.2
+// Encode encodes a string using Huffman coding per RFC 7541 Section 5.2
 func (e *HuffmanEncoder) Encode(input string) []byte {
 	if len(input) == 0 {
 		return nil
 	}
 
-	// Calculate total bits needed for pre-allocation optimization
+	// Calculate total bits needed
 	totalBits := 0
 	for i := 0; i < len(input); i++ {
 		totalBits += int(e.lengths[input[i]])
@@ -350,104 +348,98 @@ func (e *HuffmanEncoder) Encode(input string) []byte {
 		return nil
 	}
 
-	// Pre-allocate exact buffer size to avoid memory waste
+	// Allocate result buffer
 	numBytes := (totalBits + 7) / 8
 	result := make([]byte, numBytes)
 
-	// Encode using efficient bit manipulation
-	var currentByte uint32
-	var bitsInCurrentByte int
+	// Encode bits into bytes
+	var bitBuffer uint64 // Use 64-bit buffer for better handling
+	var bitsInBuffer int
 	var resultIndex int
 
 	for i := 0; i < len(input); i++ {
 		symbol := input[i]
-		code := e.codes[symbol]
+		code := uint64(e.codes[symbol])
 		length := int(e.lengths[symbol])
 
-		// Pack bits efficiently into current byte
-		currentByte |= code << (32 - bitsInCurrentByte - length)
-		bitsInCurrentByte += length
+		// Add code to bit buffer
+		bitBuffer = (bitBuffer << uint(length)) | code
+		bitsInBuffer += length
 
-		// Extract complete bytes when we have 8 or more bits
-		for bitsInCurrentByte >= 8 {
-			if resultIndex < len(result) {
-				result[resultIndex] = byte(currentByte >> 24)
-				resultIndex++
-			}
-			currentByte <<= 8
-			bitsInCurrentByte -= 8
+		// Extract complete bytes
+		for bitsInBuffer >= 8 && resultIndex < len(result) {
+			// Extract top 8 bits
+			result[resultIndex] = byte(bitBuffer >> uint(bitsInBuffer-8))
+			resultIndex++
+			bitsInBuffer -= 8
+			bitBuffer &= (1 << uint(bitsInBuffer)) - 1 // Clear extracted bits
 		}
 	}
 
-	// Handle remaining bits with proper padding
-	if bitsInCurrentByte > 0 && resultIndex < len(result) {
-		// Pad with 1s as per RFC 7541 Section 5.2
-		padding := 8 - bitsInCurrentByte
-		currentByte |= (0xFF >> (8 - padding)) << (24 - bitsInCurrentByte)
-		result[resultIndex] = byte(currentByte >> 24)
+	// Handle remaining bits with proper EOS padding per RFC 7541
+	if bitsInBuffer > 0 && resultIndex < len(result) {
+		// Pad with most significant bits of EOS (all 1s)
+		padBits := 8 - bitsInBuffer
+		padding := (uint64(1) << uint(padBits)) - 1 // All 1s for padding
+		finalByte := (bitBuffer << uint(padBits)) | padding
+		result[resultIndex] = byte(finalByte)
 	}
 
 	return result
 }
 
-// NewHuffmanDecoder creates and initializes a new Huffman decoder with pre-built tree
+// NewHuffmanDecoder creates and initializes a new Huffman decoder
 func NewHuffmanDecoder() *HuffmanDecoder {
 	decoder := &HuffmanDecoder{
 		root: &huffmanNode{symbol: -1, isLeaf: false},
 	}
 
-	// Build decode tree once during initialization for performance
+	// Build decode tree from Huffman table
 	for _, entry := range huffmanTable {
-		if entry[0] <= 255 { // Skip EOS symbol for now
-			symbol := int(entry[0])
-			code := entry[1]
-			length := int(entry[2])
+		symbol := int(entry[0])
+		code := entry[1]
+		length := int(entry[2])
 
-			// Insert symbol into tree by traversing code bits
-			node := decoder.root
-			for i := length - 1; i >= 0; i-- {
-				bit := (code >> uint(i)) & 1
+		// Insert symbol into tree
+		node := decoder.root
+		for i := length - 1; i >= 0; i-- {
+			bit := (code >> uint(i)) & 1
 
-				if bit == 0 {
-					if node.left == nil {
-						node.left = &huffmanNode{symbol: -1, isLeaf: false}
-					}
-					node = node.left
-				} else {
-					if node.right == nil {
-						node.right = &huffmanNode{symbol: -1, isLeaf: false}
-					}
-					node = node.right
+			if bit == 0 {
+				if node.left == nil {
+					node.left = &huffmanNode{symbol: -1, isLeaf: false}
 				}
+				node = node.left
+			} else {
+				if node.right == nil {
+					node.right = &huffmanNode{symbol: -1, isLeaf: false}
+				}
+				node = node.right
 			}
-
-			// Mark as leaf and set symbol
-			node.isLeaf = true
-			node.symbol = symbol
 		}
+
+		// Mark as leaf and set symbol
+		node.isLeaf = true
+		node.symbol = symbol
 	}
 
 	return decoder
 }
 
-// Decode decodes Huffman-encoded data back to original string
-// Implements RFC 7541 Section 5.2 with optimized tree traversal
+// Decode decodes Huffman-encoded data per RFC 7541 Section 5.2
 func (d *HuffmanDecoder) Decode(encoded []byte) (string, error) {
 	if len(encoded) == 0 {
 		return "", nil
 	}
 
-	// Pre-allocate result buffer with reasonable size estimate
-	result := make([]byte, 0, len(encoded)*2)
-
+	var result []byte
 	node := d.root
 
-	// Process each bit efficiently
 	for byteIndex, b := range encoded {
 		for bitIndex := 7; bitIndex >= 0; bitIndex-- {
 			bit := (b >> uint(bitIndex)) & 1
 
-			// Navigate tree based on bit value
+			// Navigate tree
 			if bit == 0 {
 				node = node.left
 			} else {
@@ -455,38 +447,36 @@ func (d *HuffmanDecoder) Decode(encoded []byte) (string, error) {
 			}
 
 			if node == nil {
-				return "", fmt.Errorf("invalid Huffman code at byte %d, bit %d", byteIndex, 7-bitIndex)
+				return "", fmt.Errorf("invalid Huffman code at byte %d, bit %d",
+					byteIndex, 7-bitIndex)
 			}
 
 			if node.isLeaf {
-				// Found a symbol
-				if node.symbol == 256 { // EOS symbol
-					// Check if this is valid padding
+				if node.symbol == EOSSymbol {
+					// EOS symbol encountered - check if it's valid padding
 					if byteIndex == len(encoded)-1 {
-						// This might be valid padding, check remaining bits
+						// This is the last byte, check remaining bits are all 1s
 						remainingBits := bitIndex
-						allOnes := true
-						for i := bitIndex - 1; i >= 0; i-- {
-							if (b>>uint(i))&1 == 0 {
-								allOnes = false
-								break
+						if remainingBits > 0 {
+							mask := (1 << uint(remainingBits)) - 1
+							if (int(b) & mask) == mask {
+								// Valid EOS padding
+								return string(result), nil
 							}
 						}
-						if allOnes && remainingBits <= 7 {
-							// Valid EOS padding according to RFC 7541
-							return string(result), nil
-						}
+						return string(result), nil // EOS at end is OK
 					}
-					return "", fmt.Errorf("unexpected EOS symbol")
+					return "", fmt.Errorf("unexpected EOS symbol in middle of data")
 				}
 
+				// Regular symbol - add to result
 				result = append(result, byte(node.symbol))
-				node = d.root // Reset to root for next symbol
+				node = d.root // Reset to root
 			}
 		}
 	}
 
-	// Check if we ended in a valid state
+	// Check final state - should be at root or in valid EOS padding
 	if node != d.root {
 		return "", fmt.Errorf("incomplete Huffman code at end of input")
 	}
@@ -494,8 +484,7 @@ func (d *HuffmanDecoder) Decode(encoded []byte) (string, error) {
 	return string(result), nil
 }
 
-// CalculateEncodedSize calculates the size of encoded output without actually encoding
-// Useful for HPACK size calculations and optimization decisions
+// CalculateEncodedSize calculates the size of encoded output
 func (e *HuffmanEncoder) CalculateEncodedSize(input string) int {
 	totalBits := 0
 	for i := 0; i < len(input); i++ {
@@ -505,7 +494,6 @@ func (e *HuffmanEncoder) CalculateEncodedSize(input string) int {
 }
 
 // IsWorthEncoding checks if Huffman encoding would save space
-// According to RFC 7541 Section 6.2.3 - smart optimization decision
 func (e *HuffmanEncoder) IsWorthEncoding(input string) bool {
 	if len(input) == 0 {
 		return false

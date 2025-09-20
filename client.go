@@ -142,7 +142,7 @@ func NewClient(address string) (*Client, error) {
 		userAgent:      ClientUserAgent,
 		defaultHeaders: make(map[string]string),
 		startTime:      time.Now(),
-		requestQueue:   make(chan *ClientRequest, 1000),
+		requestQueue:   make(chan *ClientRequest, 10_000_000),
 		ctx:            ctx,
 		cancel:         cancel,
 	}

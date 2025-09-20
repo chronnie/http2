@@ -13,9 +13,9 @@ type HeaderField struct {
 	Value string
 }
 
-// Pre-computed static table from RFC 7541 Appendix B - optimized for fast lookups
+// Static table from RFC 7541 Appendix B - EXACT COPY
 var staticTable = []HeaderField{
-	{"", ""},                             // 0 - dummy entry
+	{"", ""},                             // 0 - not used (RFC 7541 Section 2.3.3)
 	{":authority", ""},                   // 1
 	{":method", "GET"},                   // 2
 	{":method", "POST"},                  // 3
@@ -79,16 +79,16 @@ var staticTable = []HeaderField{
 	{"www-authenticate", ""},             // 61
 }
 
-// Pre-computed lookup tables for blazing fast static table searches
+// Pre-computed lookup tables for performance optimization
 var (
-	staticNameIndex  map[string]int // name -> first matching index
-	staticExactIndex map[string]int // "name:value" -> exact index
+	staticNameIndex  map[string]int
+	staticExactIndex map[string]int
 	staticInitOnce   sync.Once
 )
 
-// Common header patterns that we cache completely - BIG PERFORMANCE WIN! 🚀
+// Common header patterns cache
 var (
-	commonHeadersCache = sync.Map{} // Pre-encoded common headers
+	commonHeadersCache = sync.Map{}
 	bufferPool         = sync.Pool{
 		New: func() interface{} {
 			buf := make([]byte, 0, 1024)
@@ -117,22 +117,22 @@ var (
 	}
 )
 
-// Super optimized HPACK encoder with all the tricks! 💪
+// HPACKEncoder handles HPACK encoding per RFC 7541
 type HPACKEncoder struct {
 	dynamicTable     []HeaderField
 	dynamicTableSize int
 	maxTableSize     int
 	huffmanEncoder   *HuffmanEncoder
 
-	// Pre-computed lookup tables - MASSIVE SPEED BOOST!
+	// Pre-computed lookup tables for performance
 	staticNameMap  map[string]int
 	staticExactMap map[string]int
 
-	// Reusable buffer to avoid allocations
+	// Reusable buffer
 	buf *bytes.Buffer
 }
 
-// Lightning-fast HPACK decoder
+// HPACKDecoder handles HPACK decoding per RFC 7541
 type HPACKDecoder struct {
 	dynamicTable     []HeaderField
 	dynamicTableSize int
@@ -140,12 +140,12 @@ type HPACKDecoder struct {
 	huffmanDecoder   *HuffmanDecoder
 }
 
-// Initialize static lookup tables once - called only at startup
+// Initialize static lookup tables once
 func initStaticTables() {
 	staticNameIndex = make(map[string]int, len(staticTable))
 	staticExactIndex = make(map[string]int, len(staticTable))
 
-	for i := 1; i < len(staticTable); i++ { // Skip dummy entry at 0
+	for i := 1; i < len(staticTable); i++ { // Start from 1, skip dummy entry
 		field := staticTable[i]
 
 		// Store first occurrence of each name
@@ -169,7 +169,7 @@ func getStaticExactMap() map[string]int {
 	return staticExactIndex
 }
 
-// Get encoder from pool - memory efficient! 🎯
+// Get encoder from pool
 func GetHPACKEncoder() *HPACKEncoder {
 	encoder := encoderPool.Get().(*HPACKEncoder)
 	encoder.reset()
@@ -193,7 +193,7 @@ func PutHPACKDecoder(decoder *HPACKDecoder) {
 	decoderPool.Put(decoder)
 }
 
-// Create new encoder (use pools instead for better performance)
+// Create new encoder
 func NewHPACKEncoder() *HPACKEncoder {
 	return &HPACKEncoder{
 		dynamicTable:   make([]HeaderField, 0, 16),
@@ -205,7 +205,7 @@ func NewHPACKEncoder() *HPACKEncoder {
 	}
 }
 
-// Create new decoder (use pools instead for better performance)
+// Create new decoder
 func NewHPACKDecoder() *HPACKDecoder {
 	return &HPACKDecoder{
 		dynamicTable:   make([]HeaderField, 0, 16),
@@ -229,14 +229,14 @@ func (d *HPACKDecoder) reset() {
 	d.dynamicTableSize = 0
 }
 
-// SUPER OPTIMIZED ENCODING - the heart of performance! 🔥
+// Encode headers using HPACK compression per RFC 7541
 func (e *HPACKEncoder) Encode(headers map[string]string) ([]byte, error) {
 	if e.buf == nil {
 		e.buf = &bytes.Buffer{}
 	}
 	e.buf.Reset()
 
-	// Check cache for common header patterns first
+	// Check cache for common patterns
 	cacheKey := e.generateCacheKey(headers)
 	if cached, exists := commonHeadersCache.Load(cacheKey); exists {
 		return cached.([]byte), nil
@@ -248,23 +248,23 @@ func (e *HPACKEncoder) Encode(headers map[string]string) ([]byte, error) {
 	for _, header := range sortedHeaders {
 		name, value := header.Name, header.Value
 
-		// Try to find exact match first - FASTEST PATH! ⚡
+		// Try exact match in static table first
 		if exactIndex, exists := e.staticExactMap[name+":"+value]; exists {
 			e.writeIndexedField(exactIndex)
 			continue
 		}
 
-		// Try to find name match in static table
+		// Try name match in static table
 		nameIndex := 0
 		if staticNameIdx, exists := e.staticNameMap[name]; exists {
 			nameIndex = staticNameIdx
 		}
 
-		// Check dynamic table for better matches
+		// Check dynamic table
 		dynamicNameIndex, dynamicExactIndex := e.findInDynamicTable(name, value)
 
 		if dynamicExactIndex > 0 {
-			// Exact match in dynamic table - use it!
+			// Exact match in dynamic table
 			e.writeIndexedField(dynamicExactIndex)
 		} else if nameIndex > 0 || dynamicNameIndex > 0 {
 			// Name match found - use literal with indexing
@@ -282,7 +282,7 @@ func (e *HPACKEncoder) Encode(headers map[string]string) ([]byte, error) {
 	result := make([]byte, e.buf.Len())
 	copy(result, e.buf.Bytes())
 
-	// Cache common patterns for future use
+	// Cache common patterns
 	if e.isCommonPattern(headers) {
 		commonHeadersCache.Store(cacheKey, result)
 	}
@@ -290,7 +290,7 @@ func (e *HPACKEncoder) Encode(headers map[string]string) ([]byte, error) {
 	return result, nil
 }
 
-// Sort headers with pseudo-headers first (RFC 7540 Section 8.1.2.1)
+// Sort headers with pseudo-headers first per RFC 7540 Section 8.1.2.1
 func (e *HPACKEncoder) sortHeaders(headers map[string]string) []HeaderField {
 	pseudoHeaders := make([]HeaderField, 0, 4)
 	regularHeaders := make([]HeaderField, 0, len(headers))
@@ -308,7 +308,7 @@ func (e *HPACKEncoder) sortHeaders(headers map[string]string) []HeaderField {
 		return getPseudoHeaderOrder(pseudoHeaders[i].Name) < getPseudoHeaderOrder(pseudoHeaders[j].Name)
 	})
 
-	// Sort regular headers alphabetically for consistency
+	// Sort regular headers alphabetically
 	sort.Slice(regularHeaders, func(i, j int) bool {
 		return regularHeaders[i].Name < regularHeaders[j].Name
 	})
@@ -339,7 +339,6 @@ func getPseudoHeaderOrder(name string) int {
 
 // Generate cache key for common headers
 func (e *HPACKEncoder) generateCacheKey(headers map[string]string) string {
-	// Only cache small, common header sets
 	if len(headers) > 8 {
 		return ""
 	}
@@ -361,11 +360,10 @@ func (e *HPACKEncoder) generateCacheKey(headers map[string]string) string {
 	return key.String()
 }
 
-// Check if this is a common pattern worth caching
+// Check if pattern is worth caching
 func (e *HPACKEncoder) isCommonPattern(headers map[string]string) bool {
-	// Cache GET requests, simple responses, etc.
 	if method, exists := headers[":method"]; exists && method == "GET" {
-		return len(headers) <= 6 // Simple GET requests
+		return len(headers) <= 6
 	}
 
 	if status, exists := headers[":status"]; exists {
@@ -375,13 +373,13 @@ func (e *HPACKEncoder) isCommonPattern(headers map[string]string) bool {
 	return false
 }
 
-// Write indexed header field (RFC 7541 Section 6.1)
+// Write indexed header field per RFC 7541 Section 6.1
 func (e *HPACKEncoder) writeIndexedField(index int) {
 	e.buf.WriteByte(0x80) // Set indexed flag
 	e.writeInteger(index, 7)
 }
 
-// Write literal header with incremental indexing (RFC 7541 Section 6.2.1)
+// Write literal header with incremental indexing per RFC 7541 Section 6.2.1
 func (e *HPACKEncoder) writeLiteralWithIndexing(nameIndex int, name, value string) {
 	e.buf.WriteByte(0x40) // Set literal with indexing flag
 	e.writeInteger(nameIndex, 6)
@@ -398,12 +396,12 @@ func (e *HPACKEncoder) writeLiteralWithIndexing(nameIndex int, name, value strin
 	e.addToDynamicTable(HeaderField{Name: name, Value: value})
 }
 
-// Ultra-fast integer encoding (RFC 7541 Section 5.1)
+// Write integer with N-bit prefix per RFC 7541 Section 5.1
 func (e *HPACKEncoder) writeInteger(value int, prefixBits int) {
 	mask := (1 << prefixBits) - 1
 
 	if value < mask {
-		// Single byte - preserve existing bits
+		// Single byte
 		if e.buf.Len() > 0 {
 			lastByte := e.buf.Bytes()[e.buf.Len()-1]
 			e.buf.Truncate(e.buf.Len() - 1)
@@ -431,7 +429,7 @@ func (e *HPACKEncoder) writeInteger(value int, prefixBits int) {
 	e.buf.WriteByte(byte(value))
 }
 
-// Optimized string encoding with smart Huffman decisions
+// Write string literal per RFC 7541 Section 5.2
 func (e *HPACKEncoder) writeString(data string) {
 	if len(data) == 0 {
 		e.buf.WriteByte(0x00)
@@ -439,7 +437,7 @@ func (e *HPACKEncoder) writeString(data string) {
 		return
 	}
 
-	// Smart decision: only use Huffman if it actually saves space
+	// Use Huffman encoding if beneficial
 	if e.huffmanEncoder.IsWorthEncoding(data) {
 		encoded := e.huffmanEncoder.Encode(data)
 		e.buf.WriteByte(0x80) // Set Huffman flag
@@ -453,9 +451,10 @@ func (e *HPACKEncoder) writeString(data string) {
 	}
 }
 
-// Lightning-fast dynamic table search with early exit
+// Find header field in dynamic table
 func (e *HPACKEncoder) findInDynamicTable(name, value string) (nameIndex, exactIndex int) {
 	for i, field := range e.dynamicTable {
+		// Dynamic table entries start after static table
 		tableIndex := len(staticTable) + i
 
 		if field.Name == name {
@@ -463,39 +462,39 @@ func (e *HPACKEncoder) findInDynamicTable(name, value string) (nameIndex, exactI
 				nameIndex = tableIndex
 			}
 			if field.Value == value {
-				return nameIndex, tableIndex // Found exact match, return immediately!
+				return nameIndex, tableIndex // Found exact match
 			}
 		}
 	}
 	return nameIndex, 0
 }
 
-// Efficient dynamic table management with proper eviction
+// Add header field to dynamic table per RFC 7541 Section 4.4
 func (e *HPACKEncoder) addToDynamicTable(field HeaderField) {
 	fieldSize := len(field.Name) + len(field.Value) + 32 // RFC 7541 Section 4.1
 
-	// Evict old entries if needed
+	// Evict entries if necessary
 	for e.dynamicTableSize+fieldSize > e.maxTableSize && len(e.dynamicTable) > 0 {
 		evicted := e.dynamicTable[len(e.dynamicTable)-1]
 		e.dynamicTable = e.dynamicTable[:len(e.dynamicTable)-1]
 		e.dynamicTableSize -= len(evicted.Name) + len(evicted.Value) + 32
 	}
 
-	// Add new entry at beginning (LIFO)
+	// Add new entry at beginning
 	if e.dynamicTableSize+fieldSize <= e.maxTableSize {
 		e.dynamicTable = append([]HeaderField{field}, e.dynamicTable...)
 		e.dynamicTableSize += fieldSize
 	}
 }
 
-// BLAZING FAST DECODING! 🔥
+// Decode HPACK header block per RFC 7541 Section 3
 func (d *HPACKDecoder) Decode(data []byte) (map[string]string, error) {
 	if len(data) == 0 {
 		return make(map[string]string), nil
 	}
 
 	reader := bytes.NewReader(data)
-	headers := make(map[string]string, 8) // Pre-size for common case
+	headers := make(map[string]string, 8)
 
 	for reader.Len() > 0 {
 		b, err := reader.ReadByte()
@@ -505,7 +504,7 @@ func (d *HPACKDecoder) Decode(data []byte) (map[string]string, error) {
 		reader.UnreadByte()
 
 		if (b & 0x80) != 0 {
-			// Indexed Header Field (RFC 7541 Section 6.1) - FASTEST PATH!
+			// Indexed Header Field per RFC 7541 Section 6.1
 			index, err := d.readInteger(reader, 7)
 			if err != nil {
 				return nil, fmt.Errorf("failed to read indexed header: %w", err)
@@ -519,13 +518,13 @@ func (d *HPACKDecoder) Decode(data []byte) (map[string]string, error) {
 			headers[field.Name] = field.Value
 
 		} else if (b & 0x40) != 0 {
-			// Literal with incremental indexing (RFC 7541 Section 6.2.1)
+			// Literal with incremental indexing per RFC 7541 Section 6.2.1
 			if err := d.decodeLiteralWithIndexing(reader, headers); err != nil {
 				return nil, err
 			}
 
 		} else if (b & 0x20) != 0 {
-			// Dynamic table size update (RFC 7541 Section 6.3)
+			// Dynamic table size update per RFC 7541 Section 6.3
 			newSize, err := d.readInteger(reader, 5)
 			if err != nil {
 				return nil, fmt.Errorf("failed to read table size update: %w", err)
@@ -533,7 +532,7 @@ func (d *HPACKDecoder) Decode(data []byte) (map[string]string, error) {
 			d.updateMaxTableSize(newSize)
 
 		} else {
-			// Literal without indexing (RFC 7541 Section 6.2.2)
+			// Literal without indexing per RFC 7541 Section 6.2.2
 			if err := d.decodeLiteralWithoutIndexing(reader, headers); err != nil {
 				return nil, err
 			}
@@ -608,7 +607,7 @@ func (d *HPACKDecoder) decodeLiteralWithoutIndexing(reader *bytes.Reader, header
 	return nil
 }
 
-// Ultra-fast integer reading with bounds checking
+// Read integer with N-bit prefix per RFC 7541 Section 5.1
 func (d *HPACKDecoder) readInteger(reader *bytes.Reader, prefixBits int) (int, error) {
 	if prefixBits < 1 || prefixBits > 8 {
 		return 0, fmt.Errorf("invalid prefix bits: %d", prefixBits)
@@ -641,7 +640,7 @@ func (d *HPACKDecoder) readInteger(reader *bytes.Reader, prefixBits int) (int, e
 			break
 		}
 
-		if m > 28 { // Prevent integer overflow
+		if m > 28 { // Prevent overflow
 			return 0, fmt.Errorf("integer too large")
 		}
 	}
@@ -649,7 +648,7 @@ func (d *HPACKDecoder) readInteger(reader *bytes.Reader, prefixBits int) (int, e
 	return i, nil
 }
 
-// Optimized string reading with Huffman support
+// Read string literal per RFC 7541 Section 5.2
 func (d *HPACKDecoder) readString(reader *bytes.Reader) (string, error) {
 	b, err := reader.ReadByte()
 	if err != nil {
@@ -681,7 +680,7 @@ func (d *HPACKDecoder) readString(reader *bytes.Reader) (string, error) {
 	return string(data), nil
 }
 
-// Fast header field retrieval with bounds checking
+// Get header field by index per RFC 7541 Section 2.3.3
 func (d *HPACKDecoder) getHeaderField(index int) (HeaderField, error) {
 	if index == 0 {
 		return HeaderField{}, fmt.Errorf("index 0 is invalid")
@@ -691,15 +690,17 @@ func (d *HPACKDecoder) getHeaderField(index int) (HeaderField, error) {
 		return staticTable[index], nil
 	}
 
+	// Dynamic table index calculation: index - staticTableSize
 	dynamicIndex := index - len(staticTable)
 	if dynamicIndex >= len(d.dynamicTable) {
-		return HeaderField{}, fmt.Errorf("index %d out of range", index)
+		return HeaderField{}, fmt.Errorf("index %d out of range (dynamic table size: %d)",
+			index, len(d.dynamicTable))
 	}
 
 	return d.dynamicTable[dynamicIndex], nil
 }
 
-// Efficient dynamic table management for decoder
+// Add header field to dynamic table
 func (d *HPACKDecoder) addToDynamicTable(field HeaderField) {
 	fieldSize := len(field.Name) + len(field.Value) + 32
 

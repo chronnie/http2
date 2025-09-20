@@ -8,11 +8,11 @@ import (
 	customHttp2 "github.com/chronnie/http2"
 )
 
-const numberOfRequests = 10
+const numberOfRequests = 10_000
 
 func main() {
-	// BenchCustomHttp2()
-	BenchCustomHttp2Seq()
+	BenchCustomHttp2()
+	// BenchCustomHttp2Seq()
 }
 
 func BenchCustomHttp2Seq() {
@@ -53,10 +53,12 @@ func BenchCustomHttp2() {
 			if resp.StatusCode != 200 {
 				panic("unexpected status code")
 			}
+			// fmt.Println(resp.Body)
 			wg.Done()
 		}()
 	}
 
 	wg.Wait()
 	fmt.Printf("Send %d requests in %s\n", numberOfRequests, time.Since(timeStart))
+	// fmt.Printf("Send %d requests in %d microseconds\n", numberOfRequests, time.Since(timeStart).Microseconds())
 }
