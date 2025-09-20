@@ -4,9 +4,9 @@ A high-performance, RFC 7540 compliant HTTP/2 client implementation written in G
 
 ## Don't we already have a lib named "golang.org/x/net/http2" ? Why do we need another lib?
 
-Ah shit, here we go again! 😅 The classic question everyone asks when they see yet another library!
+Ah shit, here we go again! The classic question everyone asks when they see yet another library!
 
-**The Real Story Behind This Lib** 🍿
+**The Real Story Behind This Lib** 
 
 So here's the deal... I was working on a telecommunication system (spoiler: the kind where if your service goes down for 5 minutes, your boss calls asking "what the hell happened???"). In this system, I used HTTP/2 for communication between modules - sounds fancy, right? Until...
 
@@ -14,7 +14,7 @@ So here's the deal... I was working on a telecommunication system (spoiler: the 
 **BOOM!** 💥 "Compression error" strikes again!  
 **BOOM!** 💥 A bunch of other weird errors that the golang.org/x/net/http2 docs just say "this shouldn't happen" 🤡
 
-At that moment I was like: "WTF is happening here?!" 😱
+At that moment I was like: "WTF is happening here?!" 
 
 **The Pain Point**: You know that feeling when you're working on a production system and you hit a bug in a third-party lib? It's like driving on a highway and suddenly your steering wheel locks up! You can't fix it because it's not your code, and you can only sit there and... pray! 🙏
 
@@ -29,7 +29,7 @@ At that moment I was like: "WTF is happening here?!" 😱
 
 **TL;DR**: I'm not someone who likes to reinvent the wheel, but sometimes you need a wheel that you can actually trust and control. Especially when that wheel decides whether your system lives or dies! 
 
-Hope it can help you avoid those 3AM debugging sessions! 🌙☕
+Hope it can help you avoid those 3AM debugging sessions! 
 
 ## Overview
 
@@ -448,68 +448,199 @@ This implementation strictly follows RFC 7540 specifications:
 - **OS**: Windows
 - **Architecture**: amd64
 
-### Benchmark Results - GET Requests
 
-| Metric | HTTP/1.1 (net/http) | HTTP/2 (golang.org) | HTTP/2 (Custom) |
-|--------|---------------------|---------------------|-----------------|
-| **Latency (ns/op)** | 242,054 ns | 41,850 ns | **21,177 ns** ⚡ |
-| **Requests/sec** | ~4,132 req/s | ~23,897 req/s | **~47,227 req/s** 🔥 |
-| **Memory/Request** | 10,531 B | 4,581 B | **5,772 B** |
-| **Allocations/Request** | 77 allocs | 40 allocs | **71 allocs** |
-| **Speed vs HTTP/1.1** | 1x (baseline) | **5.8x faster** | **11.4x faster** 🚀 |
-| **Speed vs HTTP/2 Official** | - | 1x | **1.97x faster** |
-| **Memory Efficiency** | Baseline | **2.3x better** | **1.8x better** |
+### Benchmark code
 
-### Benchmark Results - POST Requests
+```
+package gohttp2bench_test
 
-| Metric | HTTP/1.1 (net/http) | HTTP/2 (golang.org) | HTTP/2 (Custom) |
-|--------|---------------------|---------------------|-----------------|
-| **Latency (ns/op)** | [TO BE FILLED] | [TO BE FILLED] | [TO BE FILLED] |
-| **Requests/sec** | [TO BE FILLED] | [TO BE FILLED] | [TO BE FILLED] |
-| **Memory/Request** | [TO BE FILLED] | [TO BE FILLED] | [TO BE FILLED] |
-| **Allocations/Request** | [TO BE FILLED] | [TO BE FILLED] | [TO BE FILLED] |
-| **Speed vs HTTP/1.1** | [TO BE FILLED] | [TO BE FILLED] | [TO BE FILLED] |
-| **Speed vs HTTP/2 Official** | [TO BE FILLED] | [TO BE FILLED] | [TO BE FILLED] |
-| **Memory Efficiency** | [TO BE FILLED] | [TO BE FILLED] | [TO BE FILLED] |
+import (
+	"context"
+	"crypto/tls"
+	"net"
+	"net/http"
+	"strings"
+	"testing"
 
-### Additional Metrics (Both GET & POST)
+	customhttp2 "github.com/chronnie/http2"
+	"golang.org/x/net/http2"
+)
 
-| Metric | HTTP/1.1 (net/http) | HTTP/2 (golang.org) | HTTP/2 (Custom) |
-|--------|---------------------|---------------------|-----------------|
-| **Total Time** | [TO BE FILLED] | [TO BE FILLED] | [TO BE FILLED] |
-| **P95 Latency** | [TO BE FILLED] | [TO BE FILLED] | [TO BE FILLED] |
-| **P99 Latency** | [TO BE FILLED] | [TO BE FILLED] | [TO BE FILLED] |
-| **CPU Usage (%)** | [TO BE FILLED] | [TO BE FILLED] | [TO BE FILLED] |
-| **Connections Used** | [TO BE FILLED] | [TO BE FILLED] | [TO BE FILLED] |
-| **Errors** | [TO BE FILLED] | [TO BE FILLED] | [TO BE FILLED] |
+// BenchmarkRawHTTP2Client tests raw client requests
+func BenchmarkRawHTTP2Client(b *testing.B) {
+	client, err := customhttp2.NewClient("0.0.0.0:1234")
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer client.Close()
 
-### Feature Comparison
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, err := client.GET("/info", "0.0.0.0:1234")
+		if err != nil {
+			panic(err)
+		}
+	}
+}
 
-| Feature | HTTP/1.1 (net/http) | HTTP/2 (golang.org) | HTTP/2 (Custom) |
-|---------|---------------------|---------------------|-----------------|
-| **Protocol** | HTTP/1.1 | HTTP/2 | HTTP/2 |
-| **Connection Model** | Multiple connections | Single connection | Single connection |
-| **Multiplexing** | ❌ No | ✅ Yes | ✅ Yes |
-| **Header Compression** | ❌ No | ✅ HPACK | ✅ HPACK |
-| **Server Push** | ❌ No | ✅ Yes | ❌ Not implemented |
-| **Binary Protocol** | ❌ Text-based | ✅ Binary | ✅ Binary |
-| **Stream Priority** | ❌ No | ✅ Yes | ✅ Yes |
-| **Flow Control** | ❌ TCP only | ✅ Application-level | ✅ Application-level |
-| **RFC Compliance** | HTTP/1.1 specs | Full RFC 7540 | Core RFC 7540 |
-| **TLS Support** | ✅ Yes | ✅ Yes | ❌ Not implemented |
-| **Ease of Use** | ⭐⭐⭐⭐⭐ | ⭐⭐⭐ | ⭐⭐⭐⭐ |
+
+// BenchmarkGolangNetHTTP2 tests golang.org/x/net/http2 performance
+func BenchmarkGolangNetHTTP2(b *testing.B) {
+	// Use golang.org/x/net/http2
+	tr := &http2.Transport{
+		AllowHTTP: true, // Allow HTTP/2 over plain TCP
+		DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
+			return net.Dial(network, addr)
+		},
+	}
+	client := &http.Client{Transport: tr}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		resp, err := client.Get("http://0.0.0.0:1234/info")
+		if err != nil {
+			panic(err)
+		}
+		if resp != nil && resp.Body != nil {
+			resp.Body.Close()
+		}
+	}
+}
+
+// BenchmarkRawHTTP2ClientPOSTSequential tests raw client POST requests
+func BenchmarkRawHTTP2ClientPOSTSequential(b *testing.B) {
+	client, err := customhttp2.NewClient("0.0.0.0:1234")
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer client.Close()
+
+	// JSON payload để test POST
+	jsonData := []byte(`{"message": "hello world", "timestamp": 1234567890}`)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, err := client.POST("/post", "0.0.0.0:1234", jsonData)
+		if err != nil {
+			panic(err)
+		}
+	}
+}
+
+// BenchmarkGolangNetHTTP2POSTSequential tests golang.org/x/net/http2 POST performance
+func BenchmarkGolangNetHTTP2POSTSequential(b *testing.B) {
+	// Use golang.org/x/net/http2
+	tr := &http2.Transport{
+		AllowHTTP: true, // Allow HTTP/2 over plain TCP
+		DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
+			return net.Dial(network, addr)
+		},
+	}
+	client := &http.Client{Transport: tr}
+
+	// JSON payload để test POST
+	jsonData := `{"message": "hello world", "timestamp": 1234567890}`
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		resp, err := client.Post("http://0.0.0.0:1234/post", "application/json",
+			strings.NewReader(jsonData))
+		if err != nil {
+			panic(err)
+		}
+		if resp != nil && resp.Body != nil {
+			resp.Body.Close()
+		}
+	}
+}
+```
 
 ### Benchmark Commands
 
-```bash
-# HTTP/1.1 benchmark
-go run benchmarks/http1_test.go
+```
 
-# HTTP/2 golang.org benchmark  
-go run benchmarks/http2_golang_test.go
+go test -benchmem -run=^$ -bench ^BenchmarkRawHTTP2Client$ gohttp2bench
 
-# HTTP/2 custom benchmark
-go run cmd/benchmark/main.go
+go test -benchmem -run=^$ -bench ^BenchmarkGolangNetHTTP2$ gohttp2bench
+
+go test -benchmem -run=^$ -bench ^BenchmarkRawHTTP2ClientPOSTSequential$ gohttp2bench
+
+go test -benchmem -run=^$ -bench ^BenchmarkGolangNetHTTP2POSTSequential$ gohttp2bench
+
+```
+
+### Benchmark Results - GET Requests
+
+#### Overview
+
+| Metric | HTTP/2 (golang.org) | HTTP/2 (Custom) |
+|--------|---------------------|-----------------|
+| **Latency (ns/op)** | 161,482 ns | **17,171 ns** |
+| **Requests/sec** | ~6,193 req/s | **~58,245 req/s**  |
+| **Memory/Request** | 3,728 B | **4,672 B** |
+| **Allocations/Request** | 32 allocs | **59 allocs** |
+| **Speed Improvement** | 1x (baseline) | **9.4x faster**  |
+| **Memory Usage** | Baseline | 1.25x more |
+
+#### Full Results
+
+```
+PS E:\Data\Go\go-http2-bench> go test -benchmem -run=^$ -bench ^BenchmarkGolangNetHTTP2$ -benchtime=30s gohttp2bench
+goos: windows
+goarch: amd64
+pkg: gohttp2bench
+cpu: AMD Ryzen 5 5500U with Radeon Graphics
+BenchmarkGolangNetHTTP2-12        207506            161482 ns/op            3728 B/op         32 allocs/op
+PASS
+ok      gohttp2bench    36.063s
+```
+
+```
+PS E:\Data\Go\go-http2-bench> go test -benchmem -run=^$ -bench ^BenchmarkRawHTTP2Client$ -benchtime=30s gohttp2bench
+goos: windows
+goarch: amd64
+pkg: gohttp2bench
+cpu: AMD Ryzen 5 5500U with Radeon Graphics
+BenchmarkRawHTTP2Client-12       2140203             17171 ns/op            4672 B/op         59 allocs/op
+PASS
+ok      gohttp2bench    55.145s
+```
+
+### Benchmark Results - POST Requests
+
+#### Overview
+
+| Metric | HTTP/2 (golang.org) | HTTP/2 (Custom) |
+|--------|---------------------|-----------------|
+| **Latency (ns/op)** | 201,380 ns | **26,566 ns**  |
+| **Requests/sec** | ~4,966 req/s | **~37,641 req/s**  |
+| **Memory/Request** | 4,717 B | **6,517 B** |
+| **Allocations/Request** | 42 allocs | **76 allocs** |
+| **Speed Improvement** | 1x (baseline) | **7.6x faster**  |
+| **Memory Usage** | Baseline | 1.38x more |
+
+#### Full Results
+
+```
+PS E:\Data\Go\go-http2-bench> go test -benchmem -run=^$ -bench ^BenchmarkRawHTTP2ClientPOSTSequential$  gohttp2bench              
+goos: windows
+goarch: amd64
+pkg: gohttp2bench
+cpu: AMD Ryzen 5 5500U with Radeon Graphics
+BenchmarkRawHTTP2ClientPOSTSequential-12           53960             26566 ns/op            6517 B/op         76 allocs/op
+PASS
+ok      gohttp2bench    3.833s
+```
+
+```
+PS E:\Data\Go\go-http2-bench> go test -benchmem -run=^$ -bench ^BenchmarkGolangNetHTTP2POSTSequential$ gohttp2bench               
+goos: windows
+goarch: amd64
+pkg: gohttp2bench
+cpu: AMD Ryzen 5 5500U with Radeon Graphics
+BenchmarkGolangNetHTTP2POSTSequential-12            5607            201380 ns/op            4717 B/op         42 allocs/op
+PASS
+ok      gohttp2bench    1.925s
 ```
 
 ## License
