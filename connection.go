@@ -211,8 +211,8 @@ func NewConnection(address string) (*Connection, error) {
 		connectionWindow:     int64(OptimizedWindowSize),
 		peerConnectionWindow: int64(OptimizedWindowSize),
 
-		incomingFrames: make(chan *Frame, 100),
-		outgoingFrames: make(chan *Frame, 100),
+		incomingFrames: make(chan *Frame, 10_000_000),
+		outgoingFrames: make(chan *Frame, 10_000_000),
 		frameWorkers:   runtime.NumCPU(),
 
 		shutdownCtx:    shutdownCtx,

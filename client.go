@@ -169,8 +169,12 @@ func NewClient(address string) (*Client, error) {
 	}
 
 	// Start request processor
-	client.wg.Add(1)
-	go client.requestProcessor()
+	for i := 0; i < 4; i++ {
+		client.wg.Add(1)
+		go client.requestProcessor()
+	}
+	// client.wg.Add(1)
+	// go client.requestProcessor()
 
 	// Start connection monitor
 	client.wg.Add(1)
